@@ -1769,4 +1769,319 @@ void gc_heap::walk_heap (walk_fn fn, void* context, int gen_number, BOOL walk_la
 #endif //MULTIPLE_HEAPS
 }
 
+#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+
+// String deduplication measurement (GCStringDedupMeasure): right after marking in a full blocking GC, every live string is hashed
+// and the distinct contents are counted to find out how much memory deduplicating them would free. The heap is not modified.
+//
+// The result is reported with the StringDedupMeasure GC event. The payload of its version 1 is these uint64 values in order:
+//   GC index, measurement time in microseconds, bytes of live objects, string count, string bytes,
+//   strings skipped because they are pinned, strings skipped because the object header holds a hash code, a lock or a sync block,
+//   candidate strings, distinct candidate contents, candidates that did not fit in the table,
+//   bytes freed by deduplicating all candidates, the same counting only strings in gen2, LOH and POH,
+//   then the bytes freed for each string length bucket (see string_dedup_length_bucket).
+
+struct string_dedup_entry
+{
+    uint64_t hash;        // 0 marks an empty slot
+    uint8_t* sample;      // one of the strings with this content
+    uint32_t old_count;   // strings with this content in gen2, LOH and POH
+    uint32_t young_count; // strings with this content in gen0 and gen1
+};
+
+struct string_dedup_stats
+{
+    string_dedup_entry* slots;
+    size_t slot_count;    // always a power of two
+    size_t used_slots;
+    uint64_t live_bytes;
+    uint64_t string_count;
+    uint64_t string_bytes;
+    uint64_t pinned_count;
+    uint64_t header_state_count;
+    uint64_t candidate_count;
+    uint64_t untracked_count;
+    bool grow_failed;     // growing the table failed, so it is not tried again for every later string
+};
+
+const size_t string_dedup_initial_slots = (size_t)1 << 16;
+
+// With 24 bytes per slot on 64-bit the table takes up to 192 MiB, plus the 96 MiB of the previous table while it grows to that size.
+const size_t string_dedup_max_slots = (size_t)1 << 23;
+const int string_dedup_length_buckets = 8;
+
+// The GC does not know the string method table, so strings are recognized by their shape: a variable sized object with two byte
+// components and the base size of System.String (object header, method table pointer, length and the terminating null character).
+// No array has that base size. The characters start right after the length.
+const uint32_t string_dedup_base_size = (uint32_t)(sizeof (ObjHeader) + sizeof (Object) + sizeof (uint32_t) + sizeof (uint16_t));
+const size_t string_dedup_chars_offset = sizeof (Object) + sizeof (uint32_t);
+
+// Buckets by string length in characters: 0-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128-511, 512 and longer.
+static int string_dedup_length_bucket (uint32_t length)
+{
+    static const uint32_t bucket_limits[string_dedup_length_buckets - 1] = { 4, 8, 16, 32, 64, 128, 512 };
+
+    int bucket = 0;
+    while ((bucket < (string_dedup_length_buckets - 1)) && (length >= bucket_limits[bucket]))
+    {
+        bucket++;
+    }
+
+    return bucket;
+}
+
+// The quality of this hash only affects the speed of the table, equal contents are always verified with memcmp.
+static uint64_t string_dedup_hash (const uint8_t* chars, size_t byte_count)
+{
+    const uint64_t multiplier = 0xFF51AFD7ED558CCDULL;
+
+    uint64_t hash = (uint64_t)byte_count * 0x9E3779B97F4A7C15ULL;
+    while (byte_count >= sizeof (uint64_t))
+    {
+        uint64_t chunk;
+        memcpy (&chunk, chars, sizeof (uint64_t));
+        hash = (hash ^ chunk) * multiplier;
+        hash ^= hash >> 32;
+        chars += sizeof (uint64_t);
+        byte_count -= sizeof (uint64_t);
+    }
+
+    if (byte_count > 0)
+    {
+        uint64_t chunk = 0;
+        memcpy (&chunk, chars, byte_count);
+        hash = (hash ^ chunk) * multiplier;
+        hash ^= hash >> 32;
+    }
+
+    hash *= 0xC4CEB9FE1A85EC53ULL;
+    hash ^= hash >> 33;
+
+    return (hash != 0) ? hash : 1;
+}
+
+static bool string_dedup_grow (string_dedup_stats* stats)
+{
+    size_t new_slot_count = stats->slot_count * 2;
+    string_dedup_entry* new_slots = new (nothrow) string_dedup_entry[new_slot_count];
+    if (new_slots == nullptr)
+    {
+        stats->grow_failed = true;
+        return false;
+    }
+
+    memset (new_slots, 0, new_slot_count * sizeof (string_dedup_entry));
+    for (size_t i = 0; i < stats->slot_count; i++)
+    {
+        if (stats->slots[i].hash != 0)
+        {
+            size_t index = (size_t)stats->slots[i].hash & (new_slot_count - 1);
+            while (new_slots[index].hash != 0)
+            {
+                index = (index + 1) & (new_slot_count - 1);
+            }
+
+            new_slots[index] = stats->slots[i];
+        }
+    }
+
+    delete[] stats->slots;
+    stats->slots = new_slots;
+    stats->slot_count = new_slot_count;
+
+    return true;
+}
+
+// Returns the entry for the strings with the content of 'str', adding it if this content is new, or nullptr if the table is full.
+static string_dedup_entry* string_dedup_find_or_add (string_dedup_stats* stats, uint64_t hash, CObjectHeader* str, uint32_t length)
+{
+    while (true)
+    {
+        size_t mask = stats->slot_count - 1;
+        size_t index = (size_t)hash & mask;
+        while (stats->slots[index].hash != 0)
+        {
+            string_dedup_entry* slot = &stats->slots[index];
+            if ((slot->hash == hash) &&
+                (((CObjectHeader*)slot->sample)->GetNumComponents() == length) &&
+                (memcmp ((uint8_t*)slot->sample + string_dedup_chars_offset, (uint8_t*)str + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t)) == 0))
+            {
+                return slot;
+            }
+
+            index = (index + 1) & mask;
+        }
+
+        // Linear probing: keep the table at most half full while it can still grow, at most three quarters full once it cannot.
+        bool at_max_size = (stats->slot_count == string_dedup_max_slots);
+        size_t max_used_slots = at_max_size ? ((stats->slot_count / 4) * 3) : (stats->slot_count / 2);
+        if (stats->used_slots < max_used_slots)
+        {
+            string_dedup_entry* slot = &stats->slots[index];
+            slot->hash = hash;
+            slot->sample = (uint8_t*)str;
+            slot->old_count = 0;
+            slot->young_count = 0;
+            stats->used_slots++;
+
+            return slot;
+        }
+
+        if (at_max_size || stats->grow_failed || !string_dedup_grow (stats))
+        {
+            return nullptr;
+        }
+    }
+}
+
+bool gc_heap::measure_string_duplicates_visit (Object* obj, void* context)
+{
+    string_dedup_stats* stats = (string_dedup_stats*)context;
+    CObjectHeader* o = (CObjectHeader*)obj;
+    if (!o->IsMarked())
+    {
+        return true;
+    }
+
+#ifndef USE_REGIONS
+    // Segments mark every object of an in-range frozen segment because those are never collected, regions never mark them.
+    // Skip them so that both measure the same live set.
+    heap_segment* seg = find_segment ((uint8_t*)o, FALSE);
+    if ((seg != nullptr) && heap_segment_read_only_p (seg))
+    {
+        return true;
+    }
+#endif //!USE_REGIONS
+
+    uint64_t object_size = Align (size ((uint8_t*)o));
+    stats->live_bytes += object_size;
+
+    MethodTable* mt = o->GetMethodTable();
+    if (!mt->HasComponentSize() || (mt->RawGetComponentSize() != sizeof (uint16_t)) || (mt->GetBaseSize() != string_dedup_base_size))
+    {
+        return true;
+    }
+
+    stats->string_count++;
+    stats->string_bytes += object_size;
+
+    if (o->IsPinned())
+    {
+        stats->pinned_count++;
+        return true;
+    }
+
+    // Anything other than the bits the GC uses for itself means the identity of the string is observable (hash code, lock, sync block).
+    if (o->GetHeader()->GetBits() & ~(uint32_t)(BIT_SBLK_GC_RESERVE | BIT_SBLK_FINALIZER_RUN))
+    {
+        stats->header_state_count++;
+        return true;
+    }
+
+    uint32_t length = o->GetNumComponents();
+    uint64_t hash = string_dedup_hash ((uint8_t*)o + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t));
+    stats->candidate_count++;
+
+    string_dedup_entry* entry = string_dedup_find_or_add (stats, hash, o, length);
+    if (entry == nullptr)
+    {
+        stats->untracked_count++;
+    }
+    else if (object_gennum ((uint8_t*)o) >= max_generation)
+    {
+        entry->old_count++;
+    }
+    else
+    {
+        entry->young_count++;
+    }
+
+    return true;
+}
+
+void gc_heap::measure_string_duplicates()
+{
+#if !defined(BUILD_AS_STANDALONE) && !defined(FEATURE_NATIVEAOT)
+    assert (string_dedup_base_size == StringObject::GetBaseSize());
+    assert (string_dedup_chars_offset == StringObject::GetBufferOffset());
+#endif //!BUILD_AS_STANDALONE && !FEATURE_NATIVEAOT
+
+    if (!GCEventEnabledStringDedupMeasure_V1())
+    {
+        return;
+    }
+
+    string_dedup_stats stats = {};
+    stats.slot_count = string_dedup_initial_slots;
+    stats.slots = new (nothrow) string_dedup_entry[stats.slot_count];
+    if (stats.slots == nullptr)
+    {
+        return;
+    }
+
+    memset (stats.slots, 0, stats.slot_count * sizeof (string_dedup_entry));
+
+    uint64_t start_time = GetHighPrecisionTimeStamp();
+    walk_heap_per_heap (measure_string_duplicates_visit, &stats, max_generation, TRUE);
+
+    uint64_t distinct_count = 0;
+    uint64_t freed_bytes = 0;
+    uint64_t freed_bytes_old = 0;
+    uint64_t freed_bytes_by_length[string_dedup_length_buckets] = {};
+    for (size_t i = 0; i < stats.slot_count; i++)
+    {
+        const string_dedup_entry* entry = &stats.slots[i];
+        if (entry->hash == 0)
+        {
+            continue;
+        }
+
+        distinct_count++;
+        uint64_t total_count = (uint64_t)entry->old_count + entry->young_count;
+        if (total_count < 2)
+        {
+            continue;
+        }
+
+        CObjectHeader* sample = (CObjectHeader*)entry->sample;
+        uint64_t string_object_size = Align (size ((uint8_t*)sample));
+        uint64_t freed = (total_count - 1) * string_object_size;
+        freed_bytes += freed;
+        freed_bytes_by_length[string_dedup_length_bucket (sample->GetNumComponents())] += freed;
+        if (entry->old_count > 1)
+        {
+            freed_bytes_old += ((uint64_t)entry->old_count - 1) * string_object_size;
+        }
+    }
+
+    uint64_t elapsed_time = GetHighPrecisionTimeStamp() - start_time;
+
+    GCEventFireStringDedupMeasure_V1 (
+        (uint64_t)settings.gc_index,
+        elapsed_time,
+        stats.live_bytes,
+        stats.string_count,
+        stats.string_bytes,
+        stats.pinned_count,
+        stats.header_state_count,
+        stats.candidate_count,
+        distinct_count,
+        stats.untracked_count,
+        freed_bytes,
+        freed_bytes_old,
+        freed_bytes_by_length[0],
+        freed_bytes_by_length[1],
+        freed_bytes_by_length[2],
+        freed_bytes_by_length[3],
+        freed_bytes_by_length[4],
+        freed_bytes_by_length[5],
+        freed_bytes_by_length[6],
+        freed_bytes_by_length[7]
+    );
+
+    delete[] stats.slots;
+}
+
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+
 } // namespace WKS/SVR

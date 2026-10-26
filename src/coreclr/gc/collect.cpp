@@ -167,6 +167,13 @@ void gc_heap::gc1()
         {
             mark_phase (n);
 
+#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+            if ((n == max_generation) && GCConfig::GetStringDedupMeasure())
+            {
+                measure_string_duplicates();
+            }
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+
             check_gen0_bricks();
 
             GCScan::GcRuntimeStructuresValid (FALSE);

@@ -2162,6 +2162,12 @@ private:
 
     PER_HEAP_METHOD void walk_heap_per_heap (walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p);
 
+#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+    PER_HEAP_METHOD void measure_string_duplicates();
+
+    PER_HEAP_ISOLATED_METHOD bool measure_string_duplicates_visit (Object* obj, void* context);
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+
     struct walk_relocate_args
     {
         uint8_t* last_plug;
