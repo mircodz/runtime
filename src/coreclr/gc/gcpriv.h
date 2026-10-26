@@ -2166,6 +2166,15 @@ private:
     PER_HEAP_METHOD void measure_string_duplicates();
 
     PER_HEAP_ISOLATED_METHOD bool measure_string_duplicates_visit (Object* obj, void* context);
+
+    PER_HEAP_METHOD void string_dedup_queue_after_mark (int condemned_gen_number);
+
+    PER_HEAP_METHOD void string_dedup_queue_relocate();
+
+    PER_HEAP_METHOD void string_dedup_queue_report();
+#ifdef VERIFY_HEAP
+    PER_HEAP_METHOD void string_dedup_queue_verify();
+#endif //VERIFY_HEAP
 #endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
 
     struct walk_relocate_args
