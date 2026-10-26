@@ -2106,21 +2106,26 @@ void gc_heap::measure_string_duplicates()
 
 // Candidate queue (GCStringDedupQueue): every blocking GC that condemns gen1 queues the live strings that are about to leave gen1, the
 // strings that survived two GCs and are likely to stay around. A queued string is only a candidate for deduplication: nothing is hashed,
-// compared or changed here. The entries do not keep their strings alive. After marking the entries of the strings that died are removed
-// and compacting GCs relocate the others, so the queue stays valid for whoever consumes it later. That only holds while no GC runs
-// concurrently with the mutator, because a background GC frees objects without passing through here.
+// compared or changed here. The entries do not keep their strings alive, like short weak handles: whoever frees or moves a queued string
+// has to update the queue, so the queue stays valid for whoever consumes it later.
+//
+// The entries only point at strings of gen2. A string that the GC leaves in a younger generation, because it is in or next to a pinned
+// plug, is removed after planning. Only a gen2 GC frees or moves a string of gen2, so only those look at the old entries: a blocking gen2
+// GC removes the entries of the strings that died and relocates the others, and a background GC removes the entries of the strings that
+// its final mark did not reach, before its sweep frees them. A gen1 GC only relocates the entries it queued itself.
 //
 // Every heap has its own queue that is filled from its own gen1. The entries can point into any heap, because the regions of a heap
 // that goes out of service move to the other heaps, which is fine because the mark bits and the relocation information are global.
 // When a heap goes out of service its entries are merged into another heap, like its finalization queue.
 //
-// The result is reported with the StringDedupQueue GC event, once for every heap and GC. The payload of its version 2 is these uint64
-// values in order:
-//   GC index, status (0 active, 1 inactive because concurrent GC is enabled, 2 inactive because the queue could not be allocated),
-//   condemned generation, live strings in gen1, strings queued, strings not queued because the queue is full,
+// The result is reported with the StringDedupQueue GC event, once for every heap and blocking or background GC. The payload of its
+// version 3 is these uint64 values in order:
+//   GC index, status (0 active, 1 inactive because the queue could not be allocated), condemned generation,
+//   live strings in gen1, strings queued, strings not queued because the queue is full,
 //   strings skipped because they are pinned, strings skipped because the object header holds a hash code, a lock or a sync block,
 //   entries removed because their string died, entries relocated by compaction, entries in the queue after the GC,
-//   time the GC spent on the queue in microseconds, heap number.
+//   time the GC spent on the queue in microseconds, heap number,
+//   entries removed because the GC left their string in a younger generation, 1 for a background GC and 0 for a blocking GC.
 
 struct string_dedup_candidate
 {
@@ -2142,6 +2147,8 @@ struct string_dedup_queue_stats
     uint64_t relocated;
     uint64_t elapsed_us;
     uint64_t heap_index;
+    uint64_t demoted;
+    uint64_t background;
     bool report_pending;
 };
 
@@ -2150,6 +2157,7 @@ struct string_dedup_queue_state
 {
     string_dedup_candidate* entries;
     size_t count;
+    size_t first_new; // the entries from this index on were queued by the blocking GC in progress
     string_dedup_queue_stats gc;
 };
 
@@ -2220,6 +2228,50 @@ static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_d
     }
 }
 
+// Removes the entries whose string was not marked, the others keep their order. Returns the number of removed entries.
+static size_t string_dedup_queue_remove_unmarked (string_dedup_queue_state* queue)
+{
+    size_t kept = 0;
+    for (size_t i = 0; i < queue->count; i++)
+    {
+        if (g_theGCHeap->IsPromoted ((Object*)queue->entries[i].obj))
+        {
+            queue->entries[kept++] = queue->entries[i];
+        }
+    }
+
+    size_t removed = queue->count - kept;
+    queue->count = kept;
+
+    return removed;
+}
+
+static void string_dedup_queue_fire (const string_dedup_queue_stats* stats, size_t queue_size)
+{
+    if (!GCEventEnabledStringDedupQueue_V3())
+    {
+        return;
+    }
+
+    GCEventFireStringDedupQueue_V3 (
+        stats->gc_index,
+        stats->status,
+        stats->condemned_generation,
+        stats->seen,
+        stats->enqueued,
+        stats->dropped,
+        stats->skipped_pinned,
+        stats->skipped_header,
+        stats->died,
+        stats->relocated,
+        (uint64_t)queue_size,
+        stats->elapsed_us,
+        stats->heap_index,
+        stats->demoted,
+        stats->background
+    );
+}
+
 // Runs right after marking in a blocking GC that condemns gen1.
 void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 {
@@ -2237,29 +2289,20 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
         queue->gc.heap_index = (uint64_t)heap_number;
         queue->gc.report_pending = true;
 
-        if (gc_can_use_concurrent)
+        if (!string_dedup_queue_reserve (queue))
         {
             queue->gc.status = 1;
-        }
-        else if (!string_dedup_queue_reserve (queue))
-        {
-            queue->gc.status = 2;
         }
         else
         {
             uint64_t start_time = GetHighPrecisionTimeStamp();
 
-            size_t kept = 0;
-            for (size_t i = 0; i < queue->count; i++)
+            if (condemned_gen_number == max_generation)
             {
-                if (g_theGCHeap->IsPromoted ((Object*)queue->entries[i].obj))
-                {
-                    queue->entries[kept++] = queue->entries[i];
-                }
+                queue->gc.died = string_dedup_queue_remove_unmarked (queue);
             }
 
-            queue->gc.died = queue->count - kept;
-            queue->count = kept;
+            queue->first_new = queue->count;
 
             if (settings.promotion)
             {
@@ -2292,7 +2335,14 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 void gc_heap::string_dedup_queue_relocate()
 {
     string_dedup_queue_state* queue = string_dedup_queue;
-    if ((queue == nullptr) || (queue->count == 0) || (settings.condemned_generation < 1))
+    if ((queue == nullptr) || !queue->gc.report_pending)
+    {
+        return;
+    }
+
+    // A gen1 GC does not move the strings of gen2.
+    size_t first = (settings.condemned_generation == max_generation) ? 0 : queue->first_new;
+    if (first == queue->count)
     {
         return;
     }
@@ -2308,7 +2358,7 @@ void gc_heap::string_dedup_queue_relocate()
     sc.thread_count = 1;
 #endif //MULTIPLE_HEAPS
 
-    for (size_t i = 0; i < queue->count; i++)
+    for (size_t i = first; i < queue->count; i++)
     {
         uint8_t* old_address = queue->entries[i].obj;
         GCHeap::Relocate ((Object**)&queue->entries[i].obj, &sc);
@@ -2321,37 +2371,86 @@ void gc_heap::string_dedup_queue_relocate()
     queue->gc.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
 }
 
+// Runs after the plan phase of every non-concurrent GC.
 void gc_heap::string_dedup_queue_report()
 {
     string_dedup_queue_state* queue = string_dedup_queue;
-    if ((queue == nullptr) || !queue->gc.report_pending)
+    if (queue == nullptr)
     {
         return;
     }
 
-    queue->gc.report_pending = false;
-    if (!GCEventEnabledStringDedupQueue_V2())
+    // The GC leaves the strings that are in or next to a pinned plug where they are, so a string can end up in a younger generation than
+    // it was in. Gen1 and gen0 GCs do not look at entries of gen2, so such entries cannot be kept. A gen2 GC can do this to any entry
+    // and a gen1 GC to the ones it queued. Without regions a GC of any generation can demote a whole segment when the heap expands.
+    bool queued = queue->gc.report_pending;
+    bool check_all = (settings.condemned_generation == max_generation);
+#ifndef USE_REGIONS
+    check_all |= settings.demotion;
+#endif //!USE_REGIONS
+    if (!queued && !check_all)
     {
         return;
     }
 
     string_dedup_queue_stats* stats = &queue->gc;
-    GCEventFireStringDedupQueue_V2 (
-        stats->gc_index,
-        stats->status,
-        stats->condemned_generation,
-        stats->seen,
-        stats->enqueued,
-        stats->dropped,
-        stats->skipped_pinned,
-        stats->skipped_header,
-        stats->died,
-        stats->relocated,
-        (uint64_t)queue->count,
-        stats->elapsed_us,
-        stats->heap_index
-    );
+    if (!queued)
+    {
+        *stats = {};
+        stats->gc_index = (uint64_t)settings.gc_index;
+        stats->condemned_generation = (uint64_t)settings.condemned_generation;
+        stats->heap_index = (uint64_t)heap_number;
+    }
+
+    stats->report_pending = false;
+
+    uint64_t start_time = GetHighPrecisionTimeStamp();
+    size_t first = check_all ? 0 : queue->first_new;
+    size_t kept = first;
+    for (size_t i = first; i < queue->count; i++)
+    {
+        if (g_theGCHeap->WhichGeneration ((Object*)queue->entries[i].obj) == max_generation)
+        {
+            queue->entries[kept++] = queue->entries[i];
+        }
+    }
+
+    stats->demoted = queue->count - kept;
+    queue->count = kept;
+    stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+
+    if (queued || (stats->demoted != 0))
+    {
+        string_dedup_queue_fire (stats, queue->count);
+    }
 }
+
+#ifdef BACKGROUND_GC
+// Runs in the final mark of a background GC, when the mark array tells which strings are alive. The sweep that follows frees the other
+// strings of gen2 without passing through the other hooks, so their entries are removed here. Every heap does this before the heaps join
+// at the end of the final mark, so no heap can sweep before all entries are checked. The EE is suspended, which keeps blocking GCs from
+// using the queue at the same time.
+void gc_heap::string_dedup_queue_background_mark()
+{
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if (queue == nullptr)
+    {
+        return;
+    }
+
+    string_dedup_queue_stats stats = {};
+    stats.gc_index = (uint64_t)settings.gc_index;
+    stats.condemned_generation = (uint64_t)max_generation;
+    stats.heap_index = (uint64_t)heap_number;
+    stats.background = 1;
+
+    uint64_t start_time = GetHighPrecisionTimeStamp();
+    stats.died = string_dedup_queue_remove_unmarked (queue);
+    stats.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+
+    string_dedup_queue_fire (&stats, queue->count);
+}
+#endif //BACKGROUND_GC
 
 #ifdef DYNAMIC_HEAP_COUNT
 // Moves the entries of a heap that goes out of service to this heap. The entries that do not fit are dropped, they are only candidates.
@@ -2382,7 +2481,8 @@ void gc_heap::string_dedup_queue_merge (gc_heap* from_hp)
 #endif //DYNAMIC_HEAP_COUNT
 
 #ifdef VERIFY_HEAP
-// Every entry must still point at the string it was queued for, which fails when an entry was not relocated or kept after its string died.
+// Every entry must still point at the string it was queued for, which fails when an entry was not relocated or kept after its string died,
+// and the string must be in gen2, which fails when an entry was not removed after the GC demoted its string.
 void gc_heap::string_dedup_queue_verify()
 {
     string_dedup_queue_state* queue = string_dedup_queue;
@@ -2401,6 +2501,11 @@ void gc_heap::string_dedup_queue_verify()
 
         CObjectHeader* str = (CObjectHeader*)o;
         if (!string_dedup_is_string (str->GetMethodTable()) || (string_dedup_signature (str) != queue->entries[i].signature))
+        {
+            FATAL_GC_ERROR();
+        }
+
+        if (g_theGCHeap->WhichGeneration ((Object*)o) != max_generation)
         {
             FATAL_GC_ERROR();
         }

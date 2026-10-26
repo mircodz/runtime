@@ -55,7 +55,7 @@ DYNAMIC_EVENT(SizeAdaptationSample, GCEventLevel_Information, GCEventKeyword_GC,
 // The payload of StringDedupMeasure is described at gc_heap::measure_string_duplicates in diagnostics.cpp.
 DYNAMIC_EVENT(StringDedupMeasure, GCEventLevel_Information, GCEventKeyword_GC, 1)
 // The payload of StringDedupQueue is described at the candidate queue in diagnostics.cpp.
-DYNAMIC_EVENT(StringDedupQueue, GCEventLevel_Information, GCEventKeyword_GC, 2)
+DYNAMIC_EVENT(StringDedupQueue, GCEventLevel_Information, GCEventKeyword_GC, 3)
 
 #undef KNOWN_EVENT
 #undef DYNAMIC_EVENT

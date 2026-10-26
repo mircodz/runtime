@@ -2174,6 +2174,15 @@ void gc_heap::background_mark_phase ()
     GCScan::GcWeakPtrScan (max_generation, max_generation, &sc);
     concurrent_print_time_delta ("NR GcWeakPtrScan");
 
+#ifdef FEATURE_EVENT_TRACE
+    // The sweep frees the dead strings and clears the mark bits, so the entries have to be checked before it. A queue can point into the
+    // regions of other heaps, which is why this comes before the join below: no heap sweeps before every heap has passed it.
+    if (GCConfig::GetStringDedupQueue())
+    {
+        string_dedup_queue_background_mark();
+    }
+#endif //FEATURE_EVENT_TRACE
+
 #ifdef MULTIPLE_HEAPS
     bgc_t_join.join(this, gc_join_null_dead_syncblk);
     if (bgc_t_join.joined())

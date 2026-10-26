@@ -2177,6 +2177,9 @@ private:
     PER_HEAP_METHOD void string_dedup_queue_relocate();
 
     PER_HEAP_METHOD void string_dedup_queue_report();
+#ifdef BACKGROUND_GC
+    PER_HEAP_METHOD void string_dedup_queue_background_mark();
+#endif //BACKGROUND_GC
 #ifdef DYNAMIC_HEAP_COUNT
     PER_HEAP_METHOD void string_dedup_queue_merge (gc_heap* from_hp);
 #endif //DYNAMIC_HEAP_COUNT
