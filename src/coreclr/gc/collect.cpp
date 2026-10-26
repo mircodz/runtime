@@ -172,12 +172,14 @@ void gc_heap::gc1()
             {
                 measure_string_duplicates();
             }
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
 
+#ifdef FEATURE_EVENT_TRACE
             if ((n >= 1) && GCConfig::GetStringDedupQueue())
             {
                 string_dedup_queue_after_mark (n);
             }
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
             check_gen0_bricks();
 
@@ -185,9 +187,9 @@ void gc_heap::gc1()
             plan_phase (n);
             GCScan::GcRuntimeStructuresValid (TRUE);
 
-#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+#ifdef FEATURE_EVENT_TRACE
             string_dedup_queue_report();
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
             check_gen0_bricks();
         }

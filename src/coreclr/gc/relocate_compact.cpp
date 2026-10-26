@@ -1467,9 +1467,9 @@ void gc_heap::relocate_phase (int condemned_gen_number,
 
     verify_pins_with_post_plug_info("after reloc stack");
 
-#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+#ifdef FEATURE_EVENT_TRACE
     string_dedup_queue_relocate();
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
 #ifdef BACKGROUND_GC
     if (gc_heap::background_running_p())

@@ -401,6 +401,9 @@ class CObjectHeader;
 class sorted_table;
 class seg_free_spaces;
 class gc_heap;
+#ifdef FEATURE_EVENT_TRACE
+struct string_dedup_queue_state;
+#endif //FEATURE_EVENT_TRACE
 
 #define youngest_generation (generation_of (0))
 #define large_object_generation (generation_of (loh_generation))
@@ -2166,16 +2169,21 @@ private:
     PER_HEAP_METHOD void measure_string_duplicates();
 
     PER_HEAP_ISOLATED_METHOD bool measure_string_duplicates_visit (Object* obj, void* context);
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
 
+#ifdef FEATURE_EVENT_TRACE
     PER_HEAP_METHOD void string_dedup_queue_after_mark (int condemned_gen_number);
 
     PER_HEAP_METHOD void string_dedup_queue_relocate();
 
     PER_HEAP_METHOD void string_dedup_queue_report();
+#ifdef DYNAMIC_HEAP_COUNT
+    PER_HEAP_METHOD void string_dedup_queue_merge (gc_heap* from_hp);
+#endif //DYNAMIC_HEAP_COUNT
 #ifdef VERIFY_HEAP
     PER_HEAP_METHOD void string_dedup_queue_verify();
 #endif //VERIFY_HEAP
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
     struct walk_relocate_args
     {
@@ -3896,6 +3904,11 @@ private:
     PER_HEAP_FIELD_MAINTAINED GCEvent bgc_idle_thread_event;
 #endif //BACKGROUND_GC
 #endif //DYNAMIC_HEAP_COUNT
+
+#ifdef FEATURE_EVENT_TRACE
+    // The strings queued as string deduplication candidates, see string_dedup_queue_after_mark.
+    PER_HEAP_FIELD_MAINTAINED string_dedup_queue_state* string_dedup_queue;
+#endif //FEATURE_EVENT_TRACE
 
     /******************************************/
     // PER_HEAP_FIELD_MAINTAINED_ALLOC fields //

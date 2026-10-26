@@ -1383,6 +1383,10 @@ int         gc_heap::gen0_must_clear_bricks = 0;
 CFinalize*  gc_heap::finalize_queue = 0;
 #endif // FEATURE_PREMORTEM_FINALIZATION
 
+#ifdef FEATURE_EVENT_TRACE
+string_dedup_queue_state* gc_heap::string_dedup_queue = nullptr;
+#endif //FEATURE_EVENT_TRACE
+
 #ifdef FEATURE_CARD_MARKING_STEALING
 VOLATILE(uint32_t) gc_heap::card_mark_chunk_index_soh;
 VOLATILE(bool) gc_heap::card_mark_done_soh;
@@ -3307,6 +3311,10 @@ gc_heap::init_gc_heap (int h_number)
     oomhist_index_per_heap = 0;
 
     freeable_uoh_segment = 0;
+
+#ifdef FEATURE_EVENT_TRACE
+    string_dedup_queue = nullptr;
+#endif //FEATURE_EVENT_TRACE
 
     condemned_generation_num = 0;
 

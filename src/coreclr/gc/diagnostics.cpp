@@ -1567,9 +1567,9 @@ void gc_heap::verify_heap (BOOL begin_gc_p)
 #endif //MULTIPLE_HEAPS
     }
 
-#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+#ifdef FEATURE_EVENT_TRACE
     string_dedup_queue_verify();
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
 #ifdef BACKGROUND_GC
     if (settings.concurrent)
@@ -1773,6 +1773,27 @@ void gc_heap::walk_heap (walk_fn fn, void* context, int gen_number, BOOL walk_la
 #endif //MULTIPLE_HEAPS
 }
 
+#ifdef FEATURE_EVENT_TRACE
+
+// The GC does not know the string method table, so strings are recognized by their shape: a variable sized object with two byte
+// components and the base size of System.String (object header, method table pointer, length and the terminating null character).
+// No array has that base size. The characters start right after the length.
+const uint32_t string_dedup_base_size = (uint32_t)(sizeof (ObjHeader) + sizeof (Object) + sizeof (uint32_t) + sizeof (uint16_t));
+const size_t string_dedup_chars_offset = sizeof (Object) + sizeof (uint32_t);
+
+static bool string_dedup_is_string (MethodTable* mt)
+{
+    return mt->HasComponentSize() && (mt->RawGetComponentSize() == sizeof (uint16_t)) && (mt->GetBaseSize() == string_dedup_base_size);
+}
+
+// Anything other than the bits the GC uses for itself means the identity of the string is observable (hash code, lock, sync block).
+static bool string_dedup_header_has_state (CObjectHeader* o)
+{
+    return (o->GetHeader()->GetBits() & ~(uint32_t)(BIT_SBLK_GC_RESERVE | BIT_SBLK_FINALIZER_RUN)) != 0;
+}
+
+#endif //FEATURE_EVENT_TRACE
+
 #if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
 
 // String deduplication measurement (GCStringDedupMeasure): right after marking in a full blocking GC, every live string is hashed
@@ -1813,23 +1834,6 @@ const size_t string_dedup_initial_slots = (size_t)1 << 16;
 // With 24 bytes per slot on 64-bit the table takes up to 192 MiB, plus the 96 MiB of the previous table while it grows to that size.
 const size_t string_dedup_max_slots = (size_t)1 << 23;
 const int string_dedup_length_buckets = 8;
-
-// The GC does not know the string method table, so strings are recognized by their shape: a variable sized object with two byte
-// components and the base size of System.String (object header, method table pointer, length and the terminating null character).
-// No array has that base size. The characters start right after the length.
-const uint32_t string_dedup_base_size = (uint32_t)(sizeof (ObjHeader) + sizeof (Object) + sizeof (uint32_t) + sizeof (uint16_t));
-const size_t string_dedup_chars_offset = sizeof (Object) + sizeof (uint32_t);
-
-static bool string_dedup_is_string (MethodTable* mt)
-{
-    return mt->HasComponentSize() && (mt->RawGetComponentSize() == sizeof (uint16_t)) && (mt->GetBaseSize() == string_dedup_base_size);
-}
-
-// Anything other than the bits the GC uses for itself means the identity of the string is observable (hash code, lock, sync block).
-static bool string_dedup_header_has_state (CObjectHeader* o)
-{
-    return (o->GetHeader()->GetBits() & ~(uint32_t)(BIT_SBLK_GC_RESERVE | BIT_SBLK_FINALIZER_RUN)) != 0;
-}
 
 // Buckets by string length in characters: 0-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128-511, 512 and longer.
 static int string_dedup_length_bucket (uint32_t length)
@@ -2096,18 +2100,27 @@ void gc_heap::measure_string_duplicates()
     delete[] stats.slots;
 }
 
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+
+#ifdef FEATURE_EVENT_TRACE
+
 // Candidate queue (GCStringDedupQueue): every blocking GC that condemns gen1 queues the live strings that are about to leave gen1, the
 // strings that survived two GCs and are likely to stay around. A queued string is only a candidate for deduplication: nothing is hashed,
 // compared or changed here. The entries do not keep their strings alive. After marking the entries of the strings that died are removed
 // and compacting GCs relocate the others, so the queue stays valid for whoever consumes it later. That only holds while no GC runs
 // concurrently with the mutator, because a background GC frees objects without passing through here.
 //
-// The result is reported with the StringDedupQueue GC event. The payload of its version 1 is these uint64 values in order:
+// Every heap has its own queue that is filled from its own gen1. The entries can point into any heap, because the regions of a heap
+// that goes out of service move to the other heaps, which is fine because the mark bits and the relocation information are global.
+// When a heap goes out of service its entries are merged into another heap, like its finalization queue.
+//
+// The result is reported with the StringDedupQueue GC event, once for every heap and GC. The payload of its version 2 is these uint64
+// values in order:
 //   GC index, status (0 active, 1 inactive because concurrent GC is enabled, 2 inactive because the queue could not be allocated),
 //   condemned generation, live strings in gen1, strings queued, strings not queued because the queue is full,
 //   strings skipped because they are pinned, strings skipped because the object header holds a hash code, a lock or a sync block,
 //   entries removed because their string died, entries relocated by compaction, entries in the queue after the GC,
-//   time the GC spent on the queue in microseconds.
+//   time the GC spent on the queue in microseconds, heap number.
 
 struct string_dedup_candidate
 {
@@ -2128,14 +2141,23 @@ struct string_dedup_queue_stats
     uint64_t died;
     uint64_t relocated;
     uint64_t elapsed_us;
+    uint64_t heap_index;
     bool report_pending;
 };
 
-const size_t string_dedup_queue_capacity = (size_t)1 << 16;
+// The queue of one heap with the statistics of the GC in progress.
+struct string_dedup_queue_state
+{
+    string_dedup_candidate* entries;
+    size_t count;
+    string_dedup_queue_stats gc;
+};
 
-static string_dedup_candidate* string_dedup_queue_entries = nullptr;
-static size_t string_dedup_queue_count = 0;
-static string_dedup_queue_stats string_dedup_queue_gc;
+#ifdef MULTIPLE_HEAPS
+const size_t string_dedup_queue_capacity = (size_t)1 << 14;
+#else //MULTIPLE_HEAPS
+const size_t string_dedup_queue_capacity = (size_t)1 << 16;
+#endif //MULTIPLE_HEAPS
 
 static uint64_t string_dedup_signature (CObjectHeader* str)
 {
@@ -2146,8 +2168,19 @@ static uint64_t string_dedup_signature (CObjectHeader* str)
     return ((uint64_t)length << 32) | first_chars;
 }
 
-static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_stats* stats)
+static bool string_dedup_queue_reserve (string_dedup_queue_state* queue)
 {
+    if (queue->entries == nullptr)
+    {
+        queue->entries = new (nothrow) string_dedup_candidate[string_dedup_queue_capacity];
+    }
+
+    return queue->entries != nullptr;
+}
+
+static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_state* queue)
+{
+    string_dedup_queue_stats* stats = &queue->gc;
     stats->seen++;
 
     if (str->IsPinned())
@@ -2158,13 +2191,13 @@ static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_stats
     {
         stats->skipped_header++;
     }
-    else if (string_dedup_queue_count == string_dedup_queue_capacity)
+    else if (queue->count == string_dedup_queue_capacity)
     {
         stats->dropped++;
     }
     else
     {
-        string_dedup_candidate* candidate = &string_dedup_queue_entries[string_dedup_queue_count++];
+        string_dedup_candidate* candidate = &queue->entries[queue->count++];
         candidate->obj = (uint8_t*)str;
         candidate->signature = string_dedup_signature (str);
         stats->enqueued++;
@@ -2172,7 +2205,7 @@ static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_stats
 }
 
 // Queues the marked strings of a range of the small object heap, the objects are parsed by size because the heap is not planned yet.
-static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_dedup_queue_stats* stats)
+static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_dedup_queue_state* queue)
 {
     uint8_t* o = start;
     while (o < end)
@@ -2180,7 +2213,7 @@ static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_d
         CObjectHeader* obj = (CObjectHeader*)o;
         if (obj->IsMarked() && string_dedup_is_string (obj->GetMethodTable()))
         {
-            string_dedup_queue_add (obj, stats);
+            string_dedup_queue_add (obj, queue);
         }
 
         o += Align (size (o));
@@ -2190,61 +2223,76 @@ static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_d
 // Runs right after marking in a blocking GC that condemns gen1.
 void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 {
-    string_dedup_queue_stats* stats = &string_dedup_queue_gc;
-    *stats = {};
-    stats->gc_index = (uint64_t)settings.gc_index;
-    stats->condemned_generation = (uint64_t)condemned_gen_number;
-    stats->report_pending = true;
-
-    if (gc_can_use_concurrent)
+    if (string_dedup_queue == nullptr)
     {
-        stats->status = 1;
-        return;
+        string_dedup_queue = new (nothrow) string_dedup_queue_state();
     }
 
-    if (string_dedup_queue_entries == nullptr)
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if (queue != nullptr)
     {
-        string_dedup_queue_entries = new (nothrow) string_dedup_candidate[string_dedup_queue_capacity];
-        if (string_dedup_queue_entries == nullptr)
+        queue->gc = {};
+        queue->gc.gc_index = (uint64_t)settings.gc_index;
+        queue->gc.condemned_generation = (uint64_t)condemned_gen_number;
+        queue->gc.heap_index = (uint64_t)heap_number;
+        queue->gc.report_pending = true;
+
+        if (gc_can_use_concurrent)
         {
-            stats->status = 2;
-            return;
+            queue->gc.status = 1;
         }
-    }
-
-    uint64_t start_time = GetHighPrecisionTimeStamp();
-
-    size_t kept = 0;
-    for (size_t i = 0; i < string_dedup_queue_count; i++)
-    {
-        if (g_theGCHeap->IsPromoted ((Object*)string_dedup_queue_entries[i].obj))
+        else if (!string_dedup_queue_reserve (queue))
         {
-            string_dedup_queue_entries[kept++] = string_dedup_queue_entries[i];
+            queue->gc.status = 2;
         }
-    }
+        else
+        {
+            uint64_t start_time = GetHighPrecisionTimeStamp();
 
-    stats->died = string_dedup_queue_count - kept;
-    string_dedup_queue_count = kept;
+            size_t kept = 0;
+            for (size_t i = 0; i < queue->count; i++)
+            {
+                if (g_theGCHeap->IsPromoted ((Object*)queue->entries[i].obj))
+                {
+                    queue->entries[kept++] = queue->entries[i];
+                }
+            }
 
-    if (settings.promotion)
-    {
+            queue->gc.died = queue->count - kept;
+            queue->count = kept;
+
+            if (settings.promotion)
+            {
 #ifdef USE_REGIONS
-        for (heap_segment* region = generation_start_segment (generation_of (1)); region != nullptr; region = heap_segment_next (region))
-        {
-            string_dedup_queue_add_range (heap_segment_mem (region), heap_segment_allocated (region), stats);
-        }
+                for (heap_segment* region = generation_start_segment (generation_of (1)); region != nullptr; region = heap_segment_next (region))
+                {
+                    string_dedup_queue_add_range (heap_segment_mem (region), heap_segment_allocated (region), queue);
+                }
 #else //USE_REGIONS
-        string_dedup_queue_add_range (generation_allocation_start (generation_of (1)), generation_allocation_start (generation_of (0)), stats);
+                string_dedup_queue_add_range (generation_allocation_start (generation_of (1)), generation_allocation_start (generation_of (0)), queue);
 #endif //USE_REGIONS
+            }
+
+            queue->gc.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+        }
     }
 
-    stats->elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+#ifdef MULTIPLE_HEAPS
+    // Planning overwrites dead objects, so no heap may start it before every heap has checked its entries, which can point into other
+    // heaps. All heaps have to get here, whatever happened above.
+    gc_t_join.join (this, gc_join_string_dedup_queue);
+    if (gc_t_join.joined())
+    {
+        gc_t_join.restart();
+    }
+#endif //MULTIPLE_HEAPS
 }
 
 // Runs in the relocate phase of a compacting GC, like the relocation of the finalization queue.
 void gc_heap::string_dedup_queue_relocate()
 {
-    if ((string_dedup_queue_count == 0) || (settings.condemned_generation < 1))
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if ((queue == nullptr) || (queue->count == 0) || (settings.condemned_generation < 1))
     {
         return;
     }
@@ -2253,36 +2301,42 @@ void gc_heap::string_dedup_queue_relocate()
 
     ScanContext sc;
     sc.promotion = FALSE;
+#ifdef MULTIPLE_HEAPS
+    sc.thread_number = heap_number;
+    sc.thread_count = n_heaps;
+#else //MULTIPLE_HEAPS
     sc.thread_count = 1;
+#endif //MULTIPLE_HEAPS
 
-    for (size_t i = 0; i < string_dedup_queue_count; i++)
+    for (size_t i = 0; i < queue->count; i++)
     {
-        uint8_t* old_address = string_dedup_queue_entries[i].obj;
-        GCHeap::Relocate ((Object**)&string_dedup_queue_entries[i].obj, &sc);
-        if (string_dedup_queue_entries[i].obj != old_address)
+        uint8_t* old_address = queue->entries[i].obj;
+        GCHeap::Relocate ((Object**)&queue->entries[i].obj, &sc);
+        if (queue->entries[i].obj != old_address)
         {
-            string_dedup_queue_gc.relocated++;
+            queue->gc.relocated++;
         }
     }
 
-    string_dedup_queue_gc.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+    queue->gc.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
 }
 
 void gc_heap::string_dedup_queue_report()
 {
-    string_dedup_queue_stats* stats = &string_dedup_queue_gc;
-    if (!stats->report_pending)
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if ((queue == nullptr) || !queue->gc.report_pending)
     {
         return;
     }
 
-    stats->report_pending = false;
-    if (!GCEventEnabledStringDedupQueue_V1())
+    queue->gc.report_pending = false;
+    if (!GCEventEnabledStringDedupQueue_V2())
     {
         return;
     }
 
-    GCEventFireStringDedupQueue_V1 (
+    string_dedup_queue_stats* stats = &queue->gc;
+    GCEventFireStringDedupQueue_V2 (
         stats->gc_index,
         stats->status,
         stats->condemned_generation,
@@ -2293,25 +2347,60 @@ void gc_heap::string_dedup_queue_report()
         stats->skipped_header,
         stats->died,
         stats->relocated,
-        (uint64_t)string_dedup_queue_count,
-        stats->elapsed_us
+        (uint64_t)queue->count,
+        stats->elapsed_us,
+        stats->heap_index
     );
 }
+
+#ifdef DYNAMIC_HEAP_COUNT
+// Moves the entries of a heap that goes out of service to this heap. The entries that do not fit are dropped, they are only candidates.
+void gc_heap::string_dedup_queue_merge (gc_heap* from_hp)
+{
+    string_dedup_queue_state* from = from_hp->string_dedup_queue;
+    if ((from == nullptr) || (from->count == 0))
+    {
+        return;
+    }
+
+    if (string_dedup_queue == nullptr)
+    {
+        string_dedup_queue = new (nothrow) string_dedup_queue_state();
+    }
+
+    string_dedup_queue_state* to = string_dedup_queue;
+    if ((to != nullptr) && string_dedup_queue_reserve (to))
+    {
+        size_t room = string_dedup_queue_capacity - to->count;
+        size_t moved = (from->count < room) ? from->count : room;
+        memcpy (&to->entries[to->count], from->entries, moved * sizeof (string_dedup_candidate));
+        to->count += moved;
+    }
+
+    from->count = 0;
+}
+#endif //DYNAMIC_HEAP_COUNT
 
 #ifdef VERIFY_HEAP
 // Every entry must still point at the string it was queued for, which fails when an entry was not relocated or kept after its string died.
 void gc_heap::string_dedup_queue_verify()
 {
-    for (size_t i = 0; i < string_dedup_queue_count; i++)
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if (queue == nullptr)
     {
-        uint8_t* o = string_dedup_queue_entries[i].obj;
+        return;
+    }
+
+    for (size_t i = 0; i < queue->count; i++)
+    {
+        uint8_t* o = queue->entries[i].obj;
         if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address) || (((size_t)o & (sizeof (void*) - 1)) != 0))
         {
             FATAL_GC_ERROR();
         }
 
         CObjectHeader* str = (CObjectHeader*)o;
-        if (!string_dedup_is_string (str->GetMethodTable()) || (string_dedup_signature (str) != string_dedup_queue_entries[i].signature))
+        if (!string_dedup_is_string (str->GetMethodTable()) || (string_dedup_signature (str) != queue->entries[i].signature))
         {
             FATAL_GC_ERROR();
         }
@@ -2319,6 +2408,6 @@ void gc_heap::string_dedup_queue_verify()
 }
 #endif //VERIFY_HEAP
 
-#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE
 
 } // namespace WKS/SVR

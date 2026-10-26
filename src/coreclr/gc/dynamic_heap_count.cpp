@@ -907,6 +907,11 @@ bool gc_heap::prepare_to_change_heap_count (int new_n_heaps)
                 return false;
             }
 
+#ifdef FEATURE_EVENT_TRACE
+            // the string dedup candidates are only a hint, so this cannot fail
+            to_hp->string_dedup_queue_merge (from_hp);
+#endif //FEATURE_EVENT_TRACE
+
             to_heap_number = (to_heap_number + 1) % new_n_heaps;
         }
     }
