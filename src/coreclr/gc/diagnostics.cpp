@@ -2162,8 +2162,12 @@ struct string_dedup_queue_stats
 // The table does not keep its strings alive either and is maintained like the queue, so all its entries point at strings of gen2: a gen2 GC
 // or a background GC removes the entries of the strings that died, a compacting gen2 GC relocates the others and the entries of the strings
 // that a GC left in a younger generation are removed after planning. The candidates are consumed right after that, when the heap is
-// consistent again, so the queue is empty after every GC and a GC only hashes the strings it queued itself. The slot of a removed entry
-// stays in use until the table is rebuilt, which also happens when it has become much smaller than its size.
+// consistent again, so the queue is empty after every GC and a GC only hashes the strings it queued itself.
+//
+// Every GC that collects gen2 visits all the entries, so the table is made for that: the strings are in an array in the order in which they
+// were added, which is mostly the address order of the batch that a GC promoted, and a separate index finds them by their hash. A pass only
+// reads the array, sequentially, and moving the strings leaves the index alone. A removed string leaves a hole in the array and a slot of
+// the index that points at it, both are dropped when the table is rebuilt, which also happens when it has become much smaller than its size.
 //
 // A GC that does not collect gen2 cannot tell whether the canonical string of a duplicate is still alive, it is only removed from the table
 // by the next gen2 or background GC. Whoever redirects references to a canonical string has to look at its mark bit in that GC first.
@@ -2179,17 +2183,21 @@ struct string_dedup_queue_stats
 
 struct string_dedup_slot
 {
-    uint8_t* obj;  // the canonical string, nullptr for an empty or a removed slot
-    uint64_t hash; // hash of the content, never 0 for a used slot: a slot with a hash and no string is a removed one
+    uint32_t entry; // 1 + the position of the string in 'strings', 0 for a slot that has never been used
+    uint32_t hash;  // hash of the content
 };
 
 struct string_dedup_table
 {
-    string_dedup_slot* slots;
-    size_t capacity;     // a power of two
-    size_t max_capacity; // a power of two, the table does not grow beyond it
-    size_t live;         // slots with a string
-    size_t removed;      // slots of removed entries, probing goes on through them
+    uint8_t** strings;        // the canonical strings in the order in which they were added, nullptr for a removed one
+    uint32_t* hashes;         // the hash of every string of 'strings', to rebuild the index
+    string_dedup_slot* slots; // the index, open addressing, the slot of a removed string is skipped
+    size_t count;             // used elements of 'strings' and 'hashes', including the removed strings
+    size_t capacity;          // allocated elements of 'strings' and 'hashes'
+    size_t max_capacity;      // the table does not grow beyond it
+    size_t slot_count;        // a power of two, the slots are at most half used, at most three quarters at the largest size
+    size_t max_slot_count;    // a power of two
+    size_t live;              // strings that have not been removed
     uint64_t seed;
 };
 
@@ -2210,13 +2218,19 @@ struct string_dedup_find_stats
     uint64_t background;
 };
 
-const size_t string_dedup_table_initial_capacity = (size_t)1 << 12;
+const size_t string_dedup_table_initial_capacity = (size_t)1 << 11;
 
-// The largest size of the table is 2^GCStringDedupFindTableBits slots. With 16 bytes per slot on 64-bit the default of 19 bits is 8 MiB and
-// holds up to 393216 strings, 24 bits are 256 MiB and hold up to twelve million. The table it is rebuilt into comes on top. Every GC that
-// collects gen2 visits all the slots, so the size is also what limits the pause that the table adds.
+// The largest size of the table is set by GCStringDedupFindTableBits: the index has at most 2^bits slots and the table holds three quarters
+// of that many strings. With the default of 21 bits that is 1572864 strings in 34 MiB on 64-bit (8 bytes for the string and 4 for its hash,
+// plus 8 bytes for every slot of the index), 24 bits hold twelve million strings in 272 MiB. The table it is rebuilt into comes on top.
+// Every GC that collects gen2 visits all the strings, so the size is also what limits the pause that the table adds.
 const int string_dedup_table_min_bits = 12;
 const int string_dedup_table_max_bits = 24;
+
+// The table starts with a capacity that the smallest allowed size has room for, and the entries of the index and the size computations have to
+// fit in 32 bits.
+static_assert (string_dedup_table_initial_capacity <= ((((size_t)1 << string_dedup_table_min_bits) / 4) * 3), "The table must not start larger than its smallest allowed size");
+static_assert (string_dedup_table_max_bits <= 30, "The table must stay within what 32 bits can count");
 
 #endif //!MULTIPLE_HEAPS
 
@@ -2416,34 +2430,69 @@ static void string_dedup_queue_fire (const string_dedup_queue_stats* stats, size
 
 #ifndef MULTIPLE_HEAPS
 
-// Rebuilds the table with another capacity from its live entries, which drops the removed ones.
+// The number of slots of the index for a table that holds 'capacity' strings: a power of two with room for twice as many strings, or for
+// four thirds as many at the largest size.
+static size_t string_dedup_table_slot_count (const string_dedup_table* table, size_t capacity)
+{
+    size_t slot_count = 1;
+    while ((slot_count < (capacity * 2)) && (slot_count < table->max_slot_count))
+    {
+        slot_count *= 2;
+    }
+
+    return slot_count;
+}
+
+// Rebuilds the table with another capacity from its live strings, which drops the removed ones and keeps the order of the others. The
+// capacity has to hold all of them. Returns false and leaves the table as it is when memory ran out.
 static bool string_dedup_table_rebuild (string_dedup_table* table, size_t capacity)
 {
-    string_dedup_slot* slots = new (nothrow) string_dedup_slot[capacity];
-    if (slots == nullptr)
+    assert ((capacity >= table->live) && (capacity <= table->max_capacity));
+
+    size_t slot_count = string_dedup_table_slot_count (table, capacity);
+    uint8_t** strings = new (nothrow) uint8_t*[capacity];
+    uint32_t* hashes = new (nothrow) uint32_t[capacity];
+    string_dedup_slot* slots = new (nothrow) string_dedup_slot[slot_count];
+    if ((strings == nullptr) || (hashes == nullptr) || (slots == nullptr))
     {
+        delete[] strings;
+        delete[] hashes;
+        delete[] slots;
+
         return false;
     }
 
-    memset (slots, 0, capacity * sizeof (string_dedup_slot));
-    for (size_t i = 0; i < table->capacity; i++)
+    memset (slots, 0, slot_count * sizeof (string_dedup_slot));
+    size_t count = 0;
+    for (size_t i = 0; i < table->count; i++)
     {
-        if (table->slots[i].obj != nullptr)
+        if (table->strings[i] != nullptr)
         {
-            size_t index = (size_t)table->slots[i].hash & (capacity - 1);
-            while (slots[index].hash != 0)
+            uint32_t hash = table->hashes[i];
+            strings[count] = table->strings[i];
+            hashes[count] = hash;
+
+            size_t index = (size_t)hash & (slot_count - 1);
+            while (slots[index].entry != 0)
             {
-                index = (index + 1) & (capacity - 1);
+                index = (index + 1) & (slot_count - 1);
             }
 
-            slots[index] = table->slots[i];
+            slots[index].entry = (uint32_t)(count + 1);
+            slots[index].hash = hash;
+            count++;
         }
     }
 
+    delete[] table->strings;
+    delete[] table->hashes;
     delete[] table->slots;
+    table->strings = strings;
+    table->hashes = hashes;
     table->slots = slots;
+    table->count = count;
     table->capacity = capacity;
-    table->removed = 0;
+    table->slot_count = slot_count;
 
     return true;
 }
@@ -2455,7 +2504,7 @@ static string_dedup_table* string_dedup_table_create()
     {
         table->seed = GetHighPrecisionTimeStamp();
 
-        int bits = (int)GCConfig::GetStringDedupFindTableBits();
+        int64_t bits = GCConfig::GetStringDedupFindTableBits();
         if (bits < string_dedup_table_min_bits)
         {
             bits = string_dedup_table_min_bits;
@@ -2465,7 +2514,8 @@ static string_dedup_table* string_dedup_table_create()
             bits = string_dedup_table_max_bits;
         }
 
-        table->max_capacity = (size_t)1 << bits;
+        table->max_slot_count = (size_t)1 << bits;
+        table->max_capacity = (table->max_slot_count / 4) * 3;
         if (!string_dedup_table_rebuild (table, string_dedup_table_initial_capacity))
         {
             delete table;
@@ -2476,46 +2526,57 @@ static string_dedup_table* string_dedup_table_create()
     return table;
 }
 
-// Called when a new entry is going to use a slot that was never used, which makes the table fuller. Keeps the used slots, including the
-// removed ones, at half of the table, or at three quarters when it cannot grow any more, which keeps probing short and makes it end at an
-// empty slot. Returns false when that is not possible because the table is at its largest size or memory ran out. 'rebuilt' is set when
-// the slots may have moved.
-static bool string_dedup_table_make_room (string_dedup_table* table, bool* rebuilt)
+// Called when a new string is going to be added to a table whose arrays are full. Every string that was ever added since the table was
+// rebuilt has a slot in the index, so the arrays being full keeps the index at most half full, or three quarters at the largest size, which
+// keeps probing short and makes it end at an empty slot. Many removed strings are dropped by rebuilding at the same size, otherwise the table
+// has to grow. Returns false when that is not possible because the table is at its largest size or memory ran out. The strings and the
+// slots have moved when it returns true.
+static bool string_dedup_table_make_room (string_dedup_table* table)
 {
-    size_t limit = (table->capacity == table->max_capacity) ? ((table->capacity / 4) * 3) : (table->capacity / 2);
-    if ((table->live + table->removed) < limit)
-    {
-        return true;
-    }
+    assert (table->count == table->capacity);
 
-    // Many removed entries are dropped by rebuilding at the same size, otherwise the table has to grow.
-    *rebuilt = true;
-    if (table->removed > (table->capacity / 8))
+    if ((table->count - table->live) > (table->capacity / 8))
     {
         return string_dedup_table_rebuild (table, table->capacity);
     }
 
-    return (table->capacity < table->max_capacity) && string_dedup_table_rebuild (table, table->capacity * 2);
+    if (table->capacity < table->max_capacity)
+    {
+        size_t capacity = table->capacity * 2;
+
+        return string_dedup_table_rebuild (table, (capacity < table->max_capacity) ? capacity : table->max_capacity);
+    }
+
+    return false;
 }
 
-// Rebuilds a table that has been emptied by removing entries at a much smaller size, so that the passes over it stay cheap.
+// Rebuilds a table that has been emptied by removing strings, at a much smaller size or without the holes that they left, so that the
+// passes over it stay cheap.
 static void string_dedup_table_shrink (string_dedup_table* table)
 {
     size_t capacity = string_dedup_table_initial_capacity;
-    while (capacity < (table->live * 4))
+    while (capacity < (table->live * 2))
     {
         capacity *= 2;
     }
 
-    if ((capacity * 4) <= table->capacity)
+    if (capacity > table->capacity)
+    {
+        capacity = table->capacity;
+    }
+
+    size_t holes = table->count - table->live;
+    if (((capacity * 4) <= table->capacity) || ((holes > 0) && (holes >= table->live)))
     {
         string_dedup_table_rebuild (table, capacity);
     }
 }
 
-static uint64_t string_dedup_table_hash (const string_dedup_table* table, CObjectHeader* str)
+static uint32_t string_dedup_table_hash (const string_dedup_table* table, CObjectHeader* str)
 {
-    return string_dedup_hash ((uint8_t*)str + string_dedup_chars_offset, (size_t)str->GetNumComponents() * sizeof (uint16_t), table->seed);
+    uint64_t hash = string_dedup_hash ((uint8_t*)str + string_dedup_chars_offset, (size_t)str->GetNumComponents() * sizeof (uint16_t), table->seed);
+
+    return (uint32_t)(hash ^ (hash >> 32));
 }
 
 static bool string_dedup_equal (CObjectHeader* a, CObjectHeader* b, uint32_t length)
@@ -2524,66 +2585,58 @@ static bool string_dedup_equal (CObjectHeader* a, CObjectHeader* b, uint32_t len
            (memcmp ((uint8_t*)a + string_dedup_chars_offset, (uint8_t*)b + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t)) == 0);
 }
 
-// Returns the slot of the canonical string with the content of 'str', or nullptr when there is none. Then 'free_index' is the slot that a
-// new entry for it takes, the first removed one on the way or else the empty one that ended the search.
-static string_dedup_slot* string_dedup_table_find (string_dedup_table* table, uint64_t hash, CObjectHeader* str, uint32_t length, size_t* free_index)
+// Returns the slot of the canonical string with the content of 'str', or nullptr when there is none. Then 'free_slot' is the empty slot that
+// ended the search, where a new string goes. The slots of removed strings are skipped, they stay in use until the table is rebuilt.
+static string_dedup_slot* string_dedup_table_find (string_dedup_table* table, uint32_t hash, CObjectHeader* str, uint32_t length, size_t* free_slot)
 {
-    size_t mask = table->capacity - 1;
+    size_t mask = table->slot_count - 1;
     size_t index = (size_t)hash & mask;
-    bool free_index_found = false;
-    while (table->slots[index].hash != 0)
+    while (table->slots[index].entry != 0)
     {
         string_dedup_slot* slot = &table->slots[index];
-        if (slot->obj == nullptr)
+        if (slot->hash == hash)
         {
-            if (!free_index_found)
+            uint8_t* canonical = table->strings[slot->entry - 1];
+            if ((canonical != nullptr) && string_dedup_equal ((CObjectHeader*)canonical, str, length))
             {
-                *free_index = index;
-                free_index_found = true;
+                return slot;
             }
-        }
-        else if ((slot->hash == hash) && string_dedup_equal ((CObjectHeader*)slot->obj, str, length))
-        {
-            return slot;
         }
 
         index = (index + 1) & mask;
     }
 
-    if (!free_index_found)
-    {
-        *free_index = index;
-    }
+    *free_slot = index;
 
     return nullptr;
 }
 
-// Removes the entries that do not pass the check. Returns the number of removed entries.
+// Removes the strings that do not pass the check. Returns the number of removed strings.
 static size_t string_dedup_table_remove_if (string_dedup_table* table, string_dedup_check check)
 {
     size_t removed = 0;
-    for (size_t i = 0; i < table->capacity; i++)
+    for (size_t i = 0; i < table->count; i++)
     {
-        string_dedup_slot* slot = &table->slots[i];
-        if ((slot->obj != nullptr) && !string_dedup_entry_passes (check, slot->obj))
+        uint8_t* obj = table->strings[i];
+        if ((obj != nullptr) && !string_dedup_entry_passes (check, obj))
         {
-            slot->obj = nullptr;
-            table->live--;
-            table->removed++;
+            table->strings[i] = nullptr;
             removed++;
         }
     }
+
+    table->live -= removed;
 
     return removed;
 }
 
 static void string_dedup_table_relocate (string_dedup_table* table, ScanContext* sc)
 {
-    for (size_t i = 0; i < table->capacity; i++)
+    for (size_t i = 0; i < table->count; i++)
     {
-        if (table->slots[i].obj != nullptr)
+        if (table->strings[i] != nullptr)
         {
-            GCHeap::Relocate ((Object**)&table->slots[i].obj, sc);
+            GCHeap::Relocate ((Object**)&table->strings[i], sc);
         }
     }
 }
@@ -2605,12 +2658,12 @@ static void string_dedup_find_consume (string_dedup_queue_state* queue, string_d
         }
 
         uint32_t length = str->GetNumComponents();
-        uint64_t hash = string_dedup_table_hash (table, str);
-        size_t free_index = 0;
-        string_dedup_slot* canonical = string_dedup_table_find (table, hash, str, length, &free_index);
+        uint32_t hash = string_dedup_table_hash (table, str);
+        size_t free_slot = 0;
+        string_dedup_slot* canonical = string_dedup_table_find (table, hash, str, length, &free_slot);
         if (canonical != nullptr)
         {
-            if (canonical->obj != (uint8_t*)str)
+            if (table->strings[canonical->entry - 1] != (uint8_t*)str)
             {
                 stats->duplicates++;
                 stats->duplicate_bytes += Align (size ((uint8_t*)str));
@@ -2619,31 +2672,23 @@ static void string_dedup_find_consume (string_dedup_queue_state* queue, string_d
             continue;
         }
 
-        // A new entry can take over a removed slot, any other slot makes the table fuller. Making room can move the slots, then the one that
-        // is free has to be searched again.
-        if (table->slots[free_index].hash == 0)
+        // Making room moves the slots, then the one that is free has to be searched again.
+        if (table->count == table->capacity)
         {
-            bool rebuilt = false;
-            if (!string_dedup_table_make_room (table, &rebuilt))
+            if (!string_dedup_table_make_room (table))
             {
                 stats->not_added++;
                 continue;
             }
 
-            if (rebuilt)
-            {
-                string_dedup_table_find (table, hash, str, length, &free_index);
-            }
+            string_dedup_table_find (table, hash, str, length, &free_slot);
         }
 
-        string_dedup_slot* slot = &table->slots[free_index];
-        if (slot->hash != 0)
-        {
-            table->removed--;
-        }
-
-        slot->obj = (uint8_t*)str;
-        slot->hash = hash;
+        table->strings[table->count] = (uint8_t*)str;
+        table->hashes[table->count] = hash;
+        table->slots[free_slot].entry = (uint32_t)(table->count + 1);
+        table->slots[free_slot].hash = hash;
+        table->count++;
         table->live++;
         stats->added++;
     }
@@ -2989,28 +3034,28 @@ static bool string_dedup_verify_content_p()
 }
 
 #ifndef MULTIPLE_HEAPS
-// Every entry must point at a string of gen2 that still has the content it was added for and that no other entry has, and the table must
-// know how many entries and removed entries it has.
+// Every string of the table must be a string of gen2 that still has the content it was added for, and the index must have exactly one slot for
+// every string that was added since the table was rebuilt, the removed ones included.
 static void string_dedup_table_verify (string_dedup_table* table)
 {
     bool verify_content_p = string_dedup_verify_content_p();
-    size_t live = 0;
-    size_t removed = 0;
-    for (size_t i = 0; i < table->capacity; i++)
+    if ((table->count > table->capacity) || (table->capacity > table->max_capacity) || (table->live > table->count) ||
+        ((table->slot_count & (table->slot_count - 1)) != 0) || (table->slot_count > table->max_slot_count) ||
+        ((table->capacity * 4) > (table->slot_count * 3)))
     {
-        string_dedup_slot* slot = &table->slots[i];
-        if (slot->obj == nullptr)
-        {
-            if (slot->hash != 0)
-            {
-                removed++;
-            }
+        FATAL_GC_ERROR();
+    }
 
+    size_t live = 0;
+    for (size_t i = 0; i < table->count; i++)
+    {
+        uint8_t* o = table->strings[i];
+        if (o == nullptr)
+        {
             continue;
         }
 
         live++;
-        uint8_t* o = slot->obj;
         if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address) || (((size_t)o & (sizeof (void*) - 1)) != 0))
         {
             FATAL_GC_ERROR();
@@ -3022,16 +3067,40 @@ static void string_dedup_table_verify (string_dedup_table* table)
             FATAL_GC_ERROR();
         }
 
-        size_t free_index = 0;
-        if (verify_content_p &&
-            ((slot->hash != string_dedup_table_hash (table, str)) ||
-             (string_dedup_table_find (table, slot->hash, str, str->GetNumComponents(), &free_index) != slot)))
+        size_t free_slot = 0;
+        if (verify_content_p)
         {
-            FATAL_GC_ERROR();
+            string_dedup_slot* slot = string_dedup_table_find (table, table->hashes[i], str, str->GetNumComponents(), &free_slot);
+            if ((table->hashes[i] != string_dedup_table_hash (table, str)) || (slot == nullptr) || (slot->entry != (i + 1)))
+            {
+                FATAL_GC_ERROR();
+            }
         }
     }
 
-    if ((live != table->live) || (removed != table->removed))
+    size_t used_slots = 0;
+    size_t live_slots = 0;
+    for (size_t i = 0; i < table->slot_count; i++)
+    {
+        uint32_t entry = table->slots[i].entry;
+        if (entry == 0)
+        {
+            continue;
+        }
+
+        used_slots++;
+        if ((entry > table->count) || (table->slots[i].hash != table->hashes[entry - 1]))
+        {
+            FATAL_GC_ERROR();
+        }
+
+        if (table->strings[entry - 1] != nullptr)
+        {
+            live_slots++;
+        }
+    }
+
+    if ((live != table->live) || (used_slots != table->count) || (live_slots != live))
     {
         FATAL_GC_ERROR();
     }
