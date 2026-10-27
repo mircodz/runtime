@@ -2161,8 +2161,10 @@ struct string_dedup_queue_stats
 //
 // The table does not keep its strings alive either and is maintained like the queue, so all its entries point at strings of gen2: a gen2 GC
 // or a background GC removes the entries of the strings that died, a compacting gen2 GC relocates the others and the entries of the strings
-// that a GC left in a younger generation are removed after planning. The candidates are consumed right after that, when the heap is
-// consistent again, so the queue is empty after every GC and a GC only hashes the strings it queued itself.
+// that a GC left in a younger generation are removed after planning. The candidates are consumed right after marking, while no string has
+// been touched by the plan phase (it can overwrite the first bytes of a string until the GC has compacted), so the queue is empty after every
+// GC and a GC only hashes the strings it queued itself. The canonical strings that it adds are still in gen1 then. A GC that does not collect
+// gen2 relocates them and removes the ones it leaves in a younger generation, which are the last entries of the table, and leaves the others.
 //
 // Every GC that collects gen2 visits all the entries, so the table is made for that: the strings are in an array in the order in which they
 // were added, which is mostly the address order of the batch that a GC promoted, and a separate index finds them by their hash. A pass only
@@ -2611,11 +2613,11 @@ static string_dedup_slot* string_dedup_table_find (string_dedup_table* table, ui
     return nullptr;
 }
 
-// Removes the strings that do not pass the check. Returns the number of removed strings.
-static size_t string_dedup_table_remove_if (string_dedup_table* table, string_dedup_check check)
+// Removes the strings from position 'first' on that do not pass the check. Returns the number of removed strings.
+static size_t string_dedup_table_remove_if (string_dedup_table* table, string_dedup_check check, size_t first)
 {
     size_t removed = 0;
-    for (size_t i = 0; i < table->count; i++)
+    for (size_t i = first; i < table->count; i++)
     {
         uint8_t* obj = table->strings[i];
         if ((obj != nullptr) && !string_dedup_entry_passes (check, obj))
@@ -2630,15 +2632,21 @@ static size_t string_dedup_table_remove_if (string_dedup_table* table, string_de
     return removed;
 }
 
-static void string_dedup_table_relocate (string_dedup_table* table, ScanContext* sc)
+static void string_dedup_table_relocate (string_dedup_table* table, ScanContext* sc, size_t first)
 {
-    for (size_t i = 0; i < table->count; i++)
+    for (size_t i = first; i < table->count; i++)
     {
         if (table->strings[i] != nullptr)
         {
             GCHeap::Relocate ((Object**)&table->strings[i], sc);
         }
     }
+}
+
+// The strings that the finder added in the GC in progress. It appends them and a rebuild keeps the order, so they are the last ones.
+static size_t string_dedup_table_added_start (const string_dedup_table* table, const string_dedup_find_stats* stats)
+{
+    return table->count - (size_t)stats->added;
 }
 
 // Takes the candidates out of the queue. A string whose content is not in the table becomes the canonical string for it, any other string
@@ -2721,8 +2729,8 @@ static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t
     );
 }
 
-// Runs after the plan phase of a GC that queued candidates or that can have left strings of the table in a younger generation.
-static void string_dedup_find_report (string_dedup_queue_state* queue, bool queued, bool check_all)
+// Runs right after marking in a blocking GC that condemns gen1, when the queue has been filled and the plan phase has not changed anything.
+static void string_dedup_find_after_mark (string_dedup_queue_state* queue)
 {
     string_dedup_find_stats* stats = &queue->find;
     uint64_t start_time = GetHighPrecisionTimeStamp();
@@ -2732,22 +2740,35 @@ static void string_dedup_find_report (string_dedup_queue_state* queue, bool queu
         queue->table = string_dedup_table_create();
     }
 
-    string_dedup_table* table = queue->table;
-    if (table == nullptr)
+    if (queue->table == nullptr)
     {
         stats->status = 1;
     }
     else
     {
-        if (check_all)
-        {
-            stats->demoted = string_dedup_table_remove_if (table, string_dedup_check_in_gen2);
-        }
+        string_dedup_find_consume (queue, queue->table, stats);
 
-        string_dedup_find_consume (queue, table, stats);
+        // This also consumed the entries that an earlier GC could not, because the table could not be created then, so none is old anymore.
+        queue->first_new = 0;
     }
 
     stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+}
+
+// Runs after the plan phase of a GC that ran the finder or that can have left strings of the table in a younger generation.
+static void string_dedup_find_report (string_dedup_queue_state* queue, bool queued, bool check_all)
+{
+    string_dedup_find_stats* stats = &queue->find;
+    string_dedup_table* table = queue->table;
+
+    if (table != nullptr)
+    {
+        uint64_t start_time = GetHighPrecisionTimeStamp();
+        size_t first = check_all ? 0 : string_dedup_table_added_start (table, stats);
+        stats->demoted = string_dedup_table_remove_if (table, string_dedup_check_in_gen2, first);
+        stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+    }
+
     if (queued || (stats->demoted != 0))
     {
         string_dedup_find_fire (stats, (table != nullptr) ? table->live : 0);
@@ -2791,7 +2812,7 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
         {
             assert (!settings.concurrent);
             uint64_t start_time = GetHighPrecisionTimeStamp();
-            queue->find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_marked);
+            queue->find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_marked, 0);
             string_dedup_table_shrink (queue->table);
             queue->find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
         }
@@ -2825,6 +2846,13 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
             }
 
             queue->gc.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+
+#ifndef MULTIPLE_HEAPS
+            if (GCConfig::GetStringDedupFind())
+            {
+                string_dedup_find_after_mark (queue);
+            }
+#endif //!MULTIPLE_HEAPS
         }
     }
 
@@ -2874,10 +2902,10 @@ void gc_heap::string_dedup_queue_relocate()
     queue->gc.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
 
 #ifndef MULTIPLE_HEAPS
-    if (gen2_p && (queue->table != nullptr))
+    if (queue->table != nullptr)
     {
         start_time = GetHighPrecisionTimeStamp();
-        string_dedup_table_relocate (queue->table, &sc);
+        string_dedup_table_relocate (queue->table, &sc, gen2_p ? 0 : string_dedup_table_added_start (queue->table, &queue->find));
         queue->find.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
     }
 #endif //!MULTIPLE_HEAPS
@@ -2984,7 +3012,7 @@ void gc_heap::string_dedup_queue_background_mark()
         find.background = 1;
 
         start_time = GetHighPrecisionTimeStamp();
-        find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_bgc_marked);
+        find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_bgc_marked, 0);
         string_dedup_table_shrink (queue->table);
         find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
 
