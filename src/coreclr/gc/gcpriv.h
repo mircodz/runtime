@@ -1562,6 +1562,8 @@ class gc_heap
 
     friend class mark_queue_t;
 
+    friend struct string_dedup_test;
+
     friend struct ::cdac_data<gc_heap>;
 
 #ifdef MULTIPLE_HEAPS

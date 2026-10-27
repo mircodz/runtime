@@ -2186,9 +2186,10 @@ struct string_dedup_slot
 struct string_dedup_table
 {
     string_dedup_slot* slots;
-    size_t capacity; // a power of two
-    size_t live;     // slots with a string
-    size_t removed;  // slots of removed entries, probing goes on through them
+    size_t capacity;     // a power of two
+    size_t max_capacity; // a power of two, the table does not grow beyond it
+    size_t live;         // slots with a string
+    size_t removed;      // slots of removed entries, probing goes on through them
     uint64_t seed;
 };
 
@@ -2211,9 +2212,11 @@ struct string_dedup_find_stats
 
 const size_t string_dedup_table_initial_capacity = (size_t)1 << 12;
 
-// With 16 bytes per slot on 64-bit the table takes up to 32 MiB and holds up to a million and a half strings. The table it is rebuilt into
-// comes on top.
-const size_t string_dedup_table_max_capacity = (size_t)1 << 21;
+// The largest size of the table is 2^GCStringDedupFindTableBits slots. With 16 bytes per slot on 64-bit the default of 19 bits is 8 MiB and
+// holds up to 393216 strings, 24 bits are 256 MiB and hold up to twelve million. The table it is rebuilt into comes on top. Every GC that
+// collects gen2 visits all the slots, so the size is also what limits the pause that the table adds.
+const int string_dedup_table_min_bits = 12;
+const int string_dedup_table_max_bits = 24;
 
 #endif //!MULTIPLE_HEAPS
 
@@ -2235,6 +2238,76 @@ const size_t string_dedup_queue_capacity = (size_t)1 << 14;
 #else //MULTIPLE_HEAPS
 const size_t string_dedup_queue_capacity = (size_t)1 << 16;
 #endif //MULTIPLE_HEAPS
+
+// The tests that the passes over the queue and the table make for each of their entries. The passes spend their time in them, so they are
+// inlined instead of going through the GC interface (GCHeap::IsPromoted and GCHeap::WhichGeneration), which costs more than the memory
+// access that the test is about.
+enum string_dedup_check
+{
+    string_dedup_check_marked,     // marked by the mark phase of a blocking GC that condemns gen2, before it plans
+#ifdef BACKGROUND_GC
+    string_dedup_check_bgc_marked, // marked by the final mark of a background GC
+#endif //BACKGROUND_GC
+    string_dedup_check_in_gen2     // in gen2 after the GC has planned the heap
+};
+
+struct string_dedup_test
+{
+    static inline gc_heap* any_heap()
+    {
+#ifdef MULTIPLE_HEAPS
+        return gc_heap::g_heaps[0];
+#else //MULTIPLE_HEAPS
+        return (gc_heap*)0;
+#endif //MULTIPLE_HEAPS
+    }
+
+    // The same as GCHeap::IsPromoted in a blocking GC that condemns gen2: whatever is outside of the range of the GC is alive.
+    static inline bool alive_after_mark (uint8_t* obj)
+    {
+        gc_heap* hp = any_heap();
+
+        return !((obj < hp->highest_address) && (obj >= hp->lowest_address)) || hp->is_mark_set (obj);
+    }
+
+#ifdef BACKGROUND_GC
+    // The same as GCHeap::IsPromoted in a background GC.
+    static inline bool alive_after_bgc_mark (uint8_t* obj)
+    {
+        gc_heap* hp = any_heap();
+
+        return !((obj < hp->background_saved_highest_address) && (obj >= hp->background_saved_lowest_address)) || hp->background_marked (obj);
+    }
+#endif //BACKGROUND_GC
+
+    // The same as GCHeap::WhichGeneration (obj) == max_generation.
+    static inline bool in_gen2 (uint8_t* obj)
+    {
+#ifdef USE_REGIONS
+        return (obj >= g_gc_lowest_address) && (obj < g_gc_highest_address) &&
+               ((gc_heap::map_region_to_generation_skewed[get_skewed_basic_region_index_for_address (obj)] & gc_heap::RI_GEN_MASK) == max_generation);
+#else //USE_REGIONS
+        return g_theGCHeap->WhichGeneration ((Object*)obj) == max_generation;
+#endif //USE_REGIONS
+    }
+};
+
+// Whether an entry passes the check, the others are removed.
+static inline bool string_dedup_entry_passes (string_dedup_check check, uint8_t* obj)
+{
+    switch (check)
+    {
+        case string_dedup_check_marked:
+            return string_dedup_test::alive_after_mark (obj);
+#ifdef BACKGROUND_GC
+        case string_dedup_check_bgc_marked:
+            return string_dedup_test::alive_after_bgc_mark (obj);
+#endif //BACKGROUND_GC
+        default:
+            assert (check == string_dedup_check_in_gen2);
+            return string_dedup_test::in_gen2 (obj);
+    }
+}
 
 static uint64_t string_dedup_signature (CObjectHeader* str)
 {
@@ -2297,13 +2370,13 @@ static void string_dedup_queue_add_range (uint8_t* start, uint8_t* end, string_d
     }
 }
 
-// Removes the entries whose string was not marked, the others keep their order. Returns the number of removed entries.
-static size_t string_dedup_queue_remove_unmarked (string_dedup_queue_state* queue)
+// Removes the entries that do not pass the check, the others keep their order. Returns the number of removed entries.
+static size_t string_dedup_queue_remove_if (string_dedup_queue_state* queue, string_dedup_check check)
 {
     size_t kept = 0;
     for (size_t i = 0; i < queue->count; i++)
     {
-        if (g_theGCHeap->IsPromoted ((Object*)queue->entries[i].obj))
+        if (string_dedup_entry_passes (check, queue->entries[i].obj))
         {
             queue->entries[kept++] = queue->entries[i];
         }
@@ -2381,6 +2454,18 @@ static string_dedup_table* string_dedup_table_create()
     if (table != nullptr)
     {
         table->seed = GetHighPrecisionTimeStamp();
+
+        int bits = (int)GCConfig::GetStringDedupFindTableBits();
+        if (bits < string_dedup_table_min_bits)
+        {
+            bits = string_dedup_table_min_bits;
+        }
+        else if (bits > string_dedup_table_max_bits)
+        {
+            bits = string_dedup_table_max_bits;
+        }
+
+        table->max_capacity = (size_t)1 << bits;
         if (!string_dedup_table_rebuild (table, string_dedup_table_initial_capacity))
         {
             delete table;
@@ -2397,7 +2482,7 @@ static string_dedup_table* string_dedup_table_create()
 // the slots may have moved.
 static bool string_dedup_table_make_room (string_dedup_table* table, bool* rebuilt)
 {
-    size_t limit = (table->capacity == string_dedup_table_max_capacity) ? ((table->capacity / 4) * 3) : (table->capacity / 2);
+    size_t limit = (table->capacity == table->max_capacity) ? ((table->capacity / 4) * 3) : (table->capacity / 2);
     if ((table->live + table->removed) < limit)
     {
         return true;
@@ -2410,7 +2495,7 @@ static bool string_dedup_table_make_room (string_dedup_table* table, bool* rebui
         return string_dedup_table_rebuild (table, table->capacity);
     }
 
-    return (table->capacity < string_dedup_table_max_capacity) && string_dedup_table_rebuild (table, table->capacity * 2);
+    return (table->capacity < table->max_capacity) && string_dedup_table_rebuild (table, table->capacity * 2);
 }
 
 // Rebuilds a table that has been emptied by removing entries at a much smaller size, so that the passes over it stay cheap.
@@ -2473,24 +2558,14 @@ static string_dedup_slot* string_dedup_table_find (string_dedup_table* table, ui
     return nullptr;
 }
 
-static bool string_dedup_is_marked (uint8_t* obj)
-{
-    return g_theGCHeap->IsPromoted ((Object*)obj);
-}
-
-static bool string_dedup_is_in_gen2 (uint8_t* obj)
-{
-    return g_theGCHeap->WhichGeneration ((Object*)obj) == max_generation;
-}
-
-// Removes the entries whose string the predicate rejects. Returns the number of removed entries.
-static size_t string_dedup_table_remove_if (string_dedup_table* table, bool (*keep) (uint8_t*))
+// Removes the entries that do not pass the check. Returns the number of removed entries.
+static size_t string_dedup_table_remove_if (string_dedup_table* table, string_dedup_check check)
 {
     size_t removed = 0;
     for (size_t i = 0; i < table->capacity; i++)
     {
         string_dedup_slot* slot = &table->slots[i];
-        if ((slot->obj != nullptr) && !keep (slot->obj))
+        if ((slot->obj != nullptr) && !string_dedup_entry_passes (check, slot->obj))
         {
             slot->obj = nullptr;
             table->live--;
@@ -2621,7 +2696,7 @@ static void string_dedup_find_report (string_dedup_queue_state* queue, bool queu
     {
         if (check_all)
         {
-            stats->demoted = string_dedup_table_remove_if (table, string_dedup_is_in_gen2);
+            stats->demoted = string_dedup_table_remove_if (table, string_dedup_check_in_gen2);
         }
 
         string_dedup_find_consume (queue, table, stats);
@@ -2669,8 +2744,9 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 
         if ((condemned_gen_number == max_generation) && (queue->table != nullptr))
         {
+            assert (!settings.concurrent);
             uint64_t start_time = GetHighPrecisionTimeStamp();
-            queue->find.died = string_dedup_table_remove_if (queue->table, string_dedup_is_marked);
+            queue->find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_marked);
             string_dedup_table_shrink (queue->table);
             queue->find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
         }
@@ -2686,7 +2762,7 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 
             if (condemned_gen_number == max_generation)
             {
-                queue->gc.died = string_dedup_queue_remove_unmarked (queue);
+                queue->gc.died = string_dedup_queue_remove_if (queue, string_dedup_check_marked);
             }
 
             queue->first_new = queue->count;
@@ -2805,7 +2881,7 @@ void gc_heap::string_dedup_queue_report()
     size_t kept = first;
     for (size_t i = first; i < queue->count; i++)
     {
-        if (g_theGCHeap->WhichGeneration ((Object*)queue->entries[i].obj) == max_generation)
+        if (string_dedup_test::in_gen2 (queue->entries[i].obj))
         {
             queue->entries[kept++] = queue->entries[i];
         }
@@ -2841,6 +2917,7 @@ void gc_heap::string_dedup_queue_background_mark()
         return;
     }
 
+    assert (settings.concurrent);
     string_dedup_queue_stats stats = {};
     stats.gc_index = (uint64_t)settings.gc_index;
     stats.condemned_generation = (uint64_t)max_generation;
@@ -2848,7 +2925,7 @@ void gc_heap::string_dedup_queue_background_mark()
     stats.background = 1;
 
     uint64_t start_time = GetHighPrecisionTimeStamp();
-    stats.died = string_dedup_queue_remove_unmarked (queue);
+    stats.died = string_dedup_queue_remove_if (queue, string_dedup_check_bgc_marked);
     stats.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
 
     string_dedup_queue_fire (&stats, queue->count);
@@ -2862,7 +2939,7 @@ void gc_heap::string_dedup_queue_background_mark()
         find.background = 1;
 
         start_time = GetHighPrecisionTimeStamp();
-        find.died = string_dedup_table_remove_if (queue->table, string_dedup_is_marked);
+        find.died = string_dedup_table_remove_if (queue->table, string_dedup_check_bgc_marked);
         string_dedup_table_shrink (queue->table);
         find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
 
@@ -2940,7 +3017,7 @@ static void string_dedup_table_verify (string_dedup_table* table)
         }
 
         CObjectHeader* str = (CObjectHeader*)o;
-        if (!string_dedup_is_string (str->GetMethodTable()) || !string_dedup_is_in_gen2 (o))
+        if (!string_dedup_is_string (str->GetMethodTable()) || (g_theGCHeap->WhichGeneration ((Object*)o) != max_generation))
         {
             FATAL_GC_ERROR();
         }
