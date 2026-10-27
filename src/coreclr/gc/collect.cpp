@@ -175,7 +175,7 @@ void gc_heap::gc1()
 #endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
 
 #ifdef FEATURE_EVENT_TRACE
-            if ((n >= 1) && GCConfig::GetStringDedupQueue())
+            if ((n >= 1) && string_dedup_queue_enabled())
             {
                 string_dedup_queue_after_mark (n);
             }

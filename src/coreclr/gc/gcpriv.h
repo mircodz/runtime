@@ -2172,6 +2172,8 @@ private:
 #endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
 
 #ifdef FEATURE_EVENT_TRACE
+    PER_HEAP_ISOLATED_METHOD bool string_dedup_queue_enabled();
+
     PER_HEAP_METHOD void string_dedup_queue_after_mark (int condemned_gen_number);
 
     PER_HEAP_METHOD void string_dedup_queue_relocate();

@@ -1849,12 +1849,13 @@ static int string_dedup_length_bucket (uint32_t length)
     return bucket;
 }
 
-// The quality of this hash only affects the speed of the table, equal contents are always verified with memcmp.
-static uint64_t string_dedup_hash (const uint8_t* chars, size_t byte_count)
+// The quality of this hash only affects the speed of the table, equal contents are always verified with memcmp. The seed keeps the contents
+// that collide from being known in advance, it is 0 where that does not matter.
+static uint64_t string_dedup_hash (const uint8_t* chars, size_t byte_count, uint64_t seed)
 {
     const uint64_t multiplier = 0xFF51AFD7ED558CCDULL;
 
-    uint64_t hash = (uint64_t)byte_count * 0x9E3779B97F4A7C15ULL;
+    uint64_t hash = ((uint64_t)byte_count ^ seed) * 0x9E3779B97F4A7C15ULL;
     while (byte_count >= sizeof (uint64_t))
     {
         uint64_t chunk;
@@ -1997,7 +1998,7 @@ bool gc_heap::measure_string_duplicates_visit (Object* obj, void* context)
     }
 
     uint32_t length = o->GetNumComponents();
-    uint64_t hash = string_dedup_hash ((uint8_t*)o + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t));
+    uint64_t hash = string_dedup_hash ((uint8_t*)o + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t), 0);
     stats->candidate_count++;
 
     string_dedup_entry* entry = string_dedup_find_or_add (stats, hash, o, length);
@@ -2152,6 +2153,70 @@ struct string_dedup_queue_stats
     bool report_pending;
 };
 
+#ifndef MULTIPLE_HEAPS
+
+// Finder (GCStringDedupFind, workstation GC only): after every blocking GC the queued candidates are hashed and looked up in a table of
+// canonical strings, the first string that was seen with each content. A candidate that finds another string with its content is a
+// duplicate. The heap is not modified, a later step is going to redirect the references to the duplicates to the canonical string.
+//
+// The table does not keep its strings alive either and is maintained like the queue, so all its entries point at strings of gen2: a gen2 GC
+// or a background GC removes the entries of the strings that died, a compacting gen2 GC relocates the others and the entries of the strings
+// that a GC left in a younger generation are removed after planning. The candidates are consumed right after that, when the heap is
+// consistent again, so the queue is empty after every GC and a GC only hashes the strings it queued itself. The slot of a removed entry
+// stays in use until the table is rebuilt, which also happens when it has become much smaller than its size.
+//
+// A GC that does not collect gen2 cannot tell whether the canonical string of a duplicate is still alive, it is only removed from the table
+// by the next gen2 or background GC. Whoever redirects references to a canonical string has to look at its mark bit in that GC first.
+// HeapVerify assumes that the strings of the table are not changed in place, because it checks their hash.
+//
+// The result is reported with the StringDedupFind GC event, once for every blocking or background GC. The payload of its version 1 is these
+// uint64 values in order:
+//   GC index, status (0 active, 1 inactive because the table could not be allocated), condemned generation,
+//   candidates examined, candidates skipped because the object header holds a hash code, a lock or a sync block,
+//   duplicates found, bytes of the duplicates, canonical strings added, candidates not added because the table is full,
+//   entries removed because their string died, entries removed because the GC left their string in a younger generation,
+//   entries in the table after the GC, time the GC spent on the finder in microseconds, 1 for a background GC and 0 for a blocking GC.
+
+struct string_dedup_slot
+{
+    uint8_t* obj;  // the canonical string, nullptr for an empty or a removed slot
+    uint64_t hash; // hash of the content, never 0 for a used slot: a slot with a hash and no string is a removed one
+};
+
+struct string_dedup_table
+{
+    string_dedup_slot* slots;
+    size_t capacity; // a power of two
+    size_t live;     // slots with a string
+    size_t removed;  // slots of removed entries, probing goes on through them
+    uint64_t seed;
+};
+
+struct string_dedup_find_stats
+{
+    uint64_t gc_index;
+    uint64_t status;
+    uint64_t condemned_generation;
+    uint64_t candidates;
+    uint64_t skipped_header;
+    uint64_t duplicates;
+    uint64_t duplicate_bytes;
+    uint64_t added;
+    uint64_t not_added;
+    uint64_t died;
+    uint64_t demoted;
+    uint64_t elapsed_us;
+    uint64_t background;
+};
+
+const size_t string_dedup_table_initial_capacity = (size_t)1 << 12;
+
+// With 16 bytes per slot on 64-bit the table takes up to 32 MiB and holds up to a million and a half strings. The table it is rebuilt into
+// comes on top.
+const size_t string_dedup_table_max_capacity = (size_t)1 << 21;
+
+#endif //!MULTIPLE_HEAPS
+
 // The queue of one heap with the statistics of the GC in progress.
 struct string_dedup_queue_state
 {
@@ -2159,6 +2224,10 @@ struct string_dedup_queue_state
     size_t count;
     size_t first_new; // the entries from this index on were queued by the blocking GC in progress
     string_dedup_queue_stats gc;
+#ifndef MULTIPLE_HEAPS
+    string_dedup_table* table;
+    string_dedup_find_stats find;
+#endif //!MULTIPLE_HEAPS
 };
 
 #ifdef MULTIPLE_HEAPS
@@ -2272,6 +2341,310 @@ static void string_dedup_queue_fire (const string_dedup_queue_stats* stats, size
     );
 }
 
+#ifndef MULTIPLE_HEAPS
+
+// Rebuilds the table with another capacity from its live entries, which drops the removed ones.
+static bool string_dedup_table_rebuild (string_dedup_table* table, size_t capacity)
+{
+    string_dedup_slot* slots = new (nothrow) string_dedup_slot[capacity];
+    if (slots == nullptr)
+    {
+        return false;
+    }
+
+    memset (slots, 0, capacity * sizeof (string_dedup_slot));
+    for (size_t i = 0; i < table->capacity; i++)
+    {
+        if (table->slots[i].obj != nullptr)
+        {
+            size_t index = (size_t)table->slots[i].hash & (capacity - 1);
+            while (slots[index].hash != 0)
+            {
+                index = (index + 1) & (capacity - 1);
+            }
+
+            slots[index] = table->slots[i];
+        }
+    }
+
+    delete[] table->slots;
+    table->slots = slots;
+    table->capacity = capacity;
+    table->removed = 0;
+
+    return true;
+}
+
+static string_dedup_table* string_dedup_table_create()
+{
+    string_dedup_table* table = new (nothrow) string_dedup_table();
+    if (table != nullptr)
+    {
+        table->seed = GetHighPrecisionTimeStamp();
+        if (!string_dedup_table_rebuild (table, string_dedup_table_initial_capacity))
+        {
+            delete table;
+            table = nullptr;
+        }
+    }
+
+    return table;
+}
+
+// Called when a new entry is going to use a slot that was never used, which makes the table fuller. Keeps the used slots, including the
+// removed ones, at half of the table, or at three quarters when it cannot grow any more, which keeps probing short and makes it end at an
+// empty slot. Returns false when that is not possible because the table is at its largest size or memory ran out. 'rebuilt' is set when
+// the slots may have moved.
+static bool string_dedup_table_make_room (string_dedup_table* table, bool* rebuilt)
+{
+    size_t limit = (table->capacity == string_dedup_table_max_capacity) ? ((table->capacity / 4) * 3) : (table->capacity / 2);
+    if ((table->live + table->removed) < limit)
+    {
+        return true;
+    }
+
+    // Many removed entries are dropped by rebuilding at the same size, otherwise the table has to grow.
+    *rebuilt = true;
+    if (table->removed > (table->capacity / 8))
+    {
+        return string_dedup_table_rebuild (table, table->capacity);
+    }
+
+    return (table->capacity < string_dedup_table_max_capacity) && string_dedup_table_rebuild (table, table->capacity * 2);
+}
+
+// Rebuilds a table that has been emptied by removing entries at a much smaller size, so that the passes over it stay cheap.
+static void string_dedup_table_shrink (string_dedup_table* table)
+{
+    size_t capacity = string_dedup_table_initial_capacity;
+    while (capacity < (table->live * 4))
+    {
+        capacity *= 2;
+    }
+
+    if ((capacity * 4) <= table->capacity)
+    {
+        string_dedup_table_rebuild (table, capacity);
+    }
+}
+
+static uint64_t string_dedup_table_hash (const string_dedup_table* table, CObjectHeader* str)
+{
+    return string_dedup_hash ((uint8_t*)str + string_dedup_chars_offset, (size_t)str->GetNumComponents() * sizeof (uint16_t), table->seed);
+}
+
+static bool string_dedup_equal (CObjectHeader* a, CObjectHeader* b, uint32_t length)
+{
+    return (a->GetNumComponents() == length) &&
+           (memcmp ((uint8_t*)a + string_dedup_chars_offset, (uint8_t*)b + string_dedup_chars_offset, (size_t)length * sizeof (uint16_t)) == 0);
+}
+
+// Returns the slot of the canonical string with the content of 'str', or nullptr when there is none. Then 'free_index' is the slot that a
+// new entry for it takes, the first removed one on the way or else the empty one that ended the search.
+static string_dedup_slot* string_dedup_table_find (string_dedup_table* table, uint64_t hash, CObjectHeader* str, uint32_t length, size_t* free_index)
+{
+    size_t mask = table->capacity - 1;
+    size_t index = (size_t)hash & mask;
+    bool free_index_found = false;
+    while (table->slots[index].hash != 0)
+    {
+        string_dedup_slot* slot = &table->slots[index];
+        if (slot->obj == nullptr)
+        {
+            if (!free_index_found)
+            {
+                *free_index = index;
+                free_index_found = true;
+            }
+        }
+        else if ((slot->hash == hash) && string_dedup_equal ((CObjectHeader*)slot->obj, str, length))
+        {
+            return slot;
+        }
+
+        index = (index + 1) & mask;
+    }
+
+    if (!free_index_found)
+    {
+        *free_index = index;
+    }
+
+    return nullptr;
+}
+
+static bool string_dedup_is_marked (uint8_t* obj)
+{
+    return g_theGCHeap->IsPromoted ((Object*)obj);
+}
+
+static bool string_dedup_is_in_gen2 (uint8_t* obj)
+{
+    return g_theGCHeap->WhichGeneration ((Object*)obj) == max_generation;
+}
+
+// Removes the entries whose string the predicate rejects. Returns the number of removed entries.
+static size_t string_dedup_table_remove_if (string_dedup_table* table, bool (*keep) (uint8_t*))
+{
+    size_t removed = 0;
+    for (size_t i = 0; i < table->capacity; i++)
+    {
+        string_dedup_slot* slot = &table->slots[i];
+        if ((slot->obj != nullptr) && !keep (slot->obj))
+        {
+            slot->obj = nullptr;
+            table->live--;
+            table->removed++;
+            removed++;
+        }
+    }
+
+    return removed;
+}
+
+static void string_dedup_table_relocate (string_dedup_table* table, ScanContext* sc)
+{
+    for (size_t i = 0; i < table->capacity; i++)
+    {
+        if (table->slots[i].obj != nullptr)
+        {
+            GCHeap::Relocate ((Object**)&table->slots[i].obj, sc);
+        }
+    }
+}
+
+// Takes the candidates out of the queue. A string whose content is not in the table becomes the canonical string for it, any other string
+// is a duplicate of the canonical one.
+static void string_dedup_find_consume (string_dedup_queue_state* queue, string_dedup_table* table, string_dedup_find_stats* stats)
+{
+    for (size_t i = 0; i < queue->count; i++)
+    {
+        CObjectHeader* str = (CObjectHeader*)queue->entries[i].obj;
+        stats->candidates++;
+
+        // The identity of the string may have become observable since it was queued.
+        if (string_dedup_header_has_state (str))
+        {
+            stats->skipped_header++;
+            continue;
+        }
+
+        uint32_t length = str->GetNumComponents();
+        uint64_t hash = string_dedup_table_hash (table, str);
+        size_t free_index = 0;
+        string_dedup_slot* canonical = string_dedup_table_find (table, hash, str, length, &free_index);
+        if (canonical != nullptr)
+        {
+            if (canonical->obj != (uint8_t*)str)
+            {
+                stats->duplicates++;
+                stats->duplicate_bytes += Align (size ((uint8_t*)str));
+            }
+
+            continue;
+        }
+
+        // A new entry can take over a removed slot, any other slot makes the table fuller. Making room can move the slots, then the one that
+        // is free has to be searched again.
+        if (table->slots[free_index].hash == 0)
+        {
+            bool rebuilt = false;
+            if (!string_dedup_table_make_room (table, &rebuilt))
+            {
+                stats->not_added++;
+                continue;
+            }
+
+            if (rebuilt)
+            {
+                string_dedup_table_find (table, hash, str, length, &free_index);
+            }
+        }
+
+        string_dedup_slot* slot = &table->slots[free_index];
+        if (slot->hash != 0)
+        {
+            table->removed--;
+        }
+
+        slot->obj = (uint8_t*)str;
+        slot->hash = hash;
+        table->live++;
+        stats->added++;
+    }
+
+    queue->count = 0;
+}
+
+static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t table_size)
+{
+    if (!GCEventEnabledStringDedupFind_V1())
+    {
+        return;
+    }
+
+    GCEventFireStringDedupFind_V1 (
+        stats->gc_index,
+        stats->status,
+        stats->condemned_generation,
+        stats->candidates,
+        stats->skipped_header,
+        stats->duplicates,
+        stats->duplicate_bytes,
+        stats->added,
+        stats->not_added,
+        stats->died,
+        stats->demoted,
+        (uint64_t)table_size,
+        stats->elapsed_us,
+        stats->background
+    );
+}
+
+// Runs after the plan phase of a GC that queued candidates or that can have left strings of the table in a younger generation.
+static void string_dedup_find_report (string_dedup_queue_state* queue, bool queued, bool check_all)
+{
+    string_dedup_find_stats* stats = &queue->find;
+    uint64_t start_time = GetHighPrecisionTimeStamp();
+
+    if (queue->table == nullptr)
+    {
+        queue->table = string_dedup_table_create();
+    }
+
+    string_dedup_table* table = queue->table;
+    if (table == nullptr)
+    {
+        stats->status = 1;
+    }
+    else
+    {
+        if (check_all)
+        {
+            stats->demoted = string_dedup_table_remove_if (table, string_dedup_is_in_gen2);
+        }
+
+        string_dedup_find_consume (queue, table, stats);
+    }
+
+    stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+    if (queued || (stats->demoted != 0))
+    {
+        string_dedup_find_fire (stats, (table != nullptr) ? table->live : 0);
+    }
+}
+
+#endif //!MULTIPLE_HEAPS
+
+bool gc_heap::string_dedup_queue_enabled()
+{
+#ifdef MULTIPLE_HEAPS
+    return GCConfig::GetStringDedupQueue();
+#else //MULTIPLE_HEAPS
+    return GCConfig::GetStringDedupQueue() || GCConfig::GetStringDedupFind();
+#endif //MULTIPLE_HEAPS
+}
+
 // Runs right after marking in a blocking GC that condemns gen1.
 void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 {
@@ -2288,6 +2661,20 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
         queue->gc.condemned_generation = (uint64_t)condemned_gen_number;
         queue->gc.heap_index = (uint64_t)heap_number;
         queue->gc.report_pending = true;
+
+#ifndef MULTIPLE_HEAPS
+        queue->find = {};
+        queue->find.gc_index = (uint64_t)settings.gc_index;
+        queue->find.condemned_generation = (uint64_t)condemned_gen_number;
+
+        if ((condemned_gen_number == max_generation) && (queue->table != nullptr))
+        {
+            uint64_t start_time = GetHighPrecisionTimeStamp();
+            queue->find.died = string_dedup_table_remove_if (queue->table, string_dedup_is_marked);
+            string_dedup_table_shrink (queue->table);
+            queue->find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+        }
+#endif //!MULTIPLE_HEAPS
 
         if (!string_dedup_queue_reserve (queue))
         {
@@ -2340,15 +2727,6 @@ void gc_heap::string_dedup_queue_relocate()
         return;
     }
 
-    // A gen1 GC does not move the strings of gen2.
-    size_t first = (settings.condemned_generation == max_generation) ? 0 : queue->first_new;
-    if (first == queue->count)
-    {
-        return;
-    }
-
-    uint64_t start_time = GetHighPrecisionTimeStamp();
-
     ScanContext sc;
     sc.promotion = FALSE;
 #ifdef MULTIPLE_HEAPS
@@ -2358,7 +2736,11 @@ void gc_heap::string_dedup_queue_relocate()
     sc.thread_count = 1;
 #endif //MULTIPLE_HEAPS
 
-    for (size_t i = first; i < queue->count; i++)
+    // A gen1 GC does not move the strings of gen2, so it only relocates the entries it queued itself.
+    bool gen2_p = (settings.condemned_generation == max_generation);
+    uint64_t start_time = GetHighPrecisionTimeStamp();
+
+    for (size_t i = (gen2_p ? 0 : queue->first_new); i < queue->count; i++)
     {
         uint8_t* old_address = queue->entries[i].obj;
         GCHeap::Relocate ((Object**)&queue->entries[i].obj, &sc);
@@ -2369,6 +2751,15 @@ void gc_heap::string_dedup_queue_relocate()
     }
 
     queue->gc.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+
+#ifndef MULTIPLE_HEAPS
+    if (gen2_p && (queue->table != nullptr))
+    {
+        start_time = GetHighPrecisionTimeStamp();
+        string_dedup_table_relocate (queue->table, &sc);
+        queue->find.elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+    }
+#endif //!MULTIPLE_HEAPS
 }
 
 // Runs after the plan phase of every non-concurrent GC.
@@ -2400,6 +2791,11 @@ void gc_heap::string_dedup_queue_report()
         stats->gc_index = (uint64_t)settings.gc_index;
         stats->condemned_generation = (uint64_t)settings.condemned_generation;
         stats->heap_index = (uint64_t)heap_number;
+#ifndef MULTIPLE_HEAPS
+        queue->find = {};
+        queue->find.gc_index = stats->gc_index;
+        queue->find.condemned_generation = stats->condemned_generation;
+#endif //!MULTIPLE_HEAPS
     }
 
     stats->report_pending = false;
@@ -2418,6 +2814,13 @@ void gc_heap::string_dedup_queue_report()
     stats->demoted = queue->count - kept;
     queue->count = kept;
     stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+
+#ifndef MULTIPLE_HEAPS
+    if (GCConfig::GetStringDedupFind())
+    {
+        string_dedup_find_report (queue, queued, check_all);
+    }
+#endif //!MULTIPLE_HEAPS
 
     if (queued || (stats->demoted != 0))
     {
@@ -2449,6 +2852,23 @@ void gc_heap::string_dedup_queue_background_mark()
     stats.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
 
     string_dedup_queue_fire (&stats, queue->count);
+
+#ifndef MULTIPLE_HEAPS
+    if (queue->table != nullptr)
+    {
+        string_dedup_find_stats find = {};
+        find.gc_index = stats.gc_index;
+        find.condemned_generation = stats.condemned_generation;
+        find.background = 1;
+
+        start_time = GetHighPrecisionTimeStamp();
+        find.died = string_dedup_table_remove_if (queue->table, string_dedup_is_marked);
+        string_dedup_table_shrink (queue->table);
+        find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
+
+        string_dedup_find_fire (&find, queue->table->live);
+    }
+#endif //!MULTIPLE_HEAPS
 }
 #endif //BACKGROUND_GC
 
@@ -2481,6 +2901,66 @@ void gc_heap::string_dedup_queue_merge (gc_heap* from_hp)
 #endif //DYNAMIC_HEAP_COUNT
 
 #ifdef VERIFY_HEAP
+// The strings that GC stress allocates are chopped in place, which changes their length and content.
+static bool string_dedup_verify_content_p()
+{
+#if defined(STRESS_HEAP) && !defined(FEATURE_NATIVEAOT)
+    return !GCStress<cfg_any>::IsEnabled();
+#else
+    return true;
+#endif //STRESS_HEAP && !FEATURE_NATIVEAOT
+}
+
+#ifndef MULTIPLE_HEAPS
+// Every entry must point at a string of gen2 that still has the content it was added for and that no other entry has, and the table must
+// know how many entries and removed entries it has.
+static void string_dedup_table_verify (string_dedup_table* table)
+{
+    bool verify_content_p = string_dedup_verify_content_p();
+    size_t live = 0;
+    size_t removed = 0;
+    for (size_t i = 0; i < table->capacity; i++)
+    {
+        string_dedup_slot* slot = &table->slots[i];
+        if (slot->obj == nullptr)
+        {
+            if (slot->hash != 0)
+            {
+                removed++;
+            }
+
+            continue;
+        }
+
+        live++;
+        uint8_t* o = slot->obj;
+        if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address) || (((size_t)o & (sizeof (void*) - 1)) != 0))
+        {
+            FATAL_GC_ERROR();
+        }
+
+        CObjectHeader* str = (CObjectHeader*)o;
+        if (!string_dedup_is_string (str->GetMethodTable()) || !string_dedup_is_in_gen2 (o))
+        {
+            FATAL_GC_ERROR();
+        }
+
+        size_t free_index = 0;
+        if (verify_content_p &&
+            ((slot->hash != string_dedup_table_hash (table, str)) ||
+             (string_dedup_table_find (table, slot->hash, str, str->GetNumComponents(), &free_index) != slot)))
+        {
+            FATAL_GC_ERROR();
+        }
+    }
+
+    if ((live != table->live) || (removed != table->removed))
+    {
+        FATAL_GC_ERROR();
+    }
+}
+#endif //!MULTIPLE_HEAPS
+
 // Every entry must still point at the string it was queued for, which fails when an entry was not relocated or kept after its string died,
 // and the string must be in gen2, which fails when an entry was not removed after the GC demoted its string.
 void gc_heap::string_dedup_queue_verify()
@@ -2491,6 +2971,7 @@ void gc_heap::string_dedup_queue_verify()
         return;
     }
 
+    bool verify_content_p = string_dedup_verify_content_p();
     for (size_t i = 0; i < queue->count; i++)
     {
         uint8_t* o = queue->entries[i].obj;
@@ -2500,7 +2981,7 @@ void gc_heap::string_dedup_queue_verify()
         }
 
         CObjectHeader* str = (CObjectHeader*)o;
-        if (!string_dedup_is_string (str->GetMethodTable()) || (string_dedup_signature (str) != queue->entries[i].signature))
+        if (!string_dedup_is_string (str->GetMethodTable()) || (verify_content_p && (string_dedup_signature (str) != queue->entries[i].signature)))
         {
             FATAL_GC_ERROR();
         }
@@ -2510,6 +2991,13 @@ void gc_heap::string_dedup_queue_verify()
             FATAL_GC_ERROR();
         }
     }
+
+#ifndef MULTIPLE_HEAPS
+    if (queue->table != nullptr)
+    {
+        string_dedup_table_verify (queue->table);
+    }
+#endif //!MULTIPLE_HEAPS
 }
 #endif //VERIFY_HEAP
 

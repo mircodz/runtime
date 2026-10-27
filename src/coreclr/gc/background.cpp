@@ -2177,7 +2177,7 @@ void gc_heap::background_mark_phase ()
 #ifdef FEATURE_EVENT_TRACE
     // The sweep frees the dead strings and clears the mark bits, so the entries have to be checked before it. A queue can point into the
     // regions of other heaps, which is why this comes before the join below: no heap sweeps before every heap has passed it.
-    if (GCConfig::GetStringDedupQueue())
+    if (string_dedup_queue_enabled())
     {
         string_dedup_queue_background_mark();
     }
