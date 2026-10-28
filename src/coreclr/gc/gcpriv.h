@@ -2196,6 +2196,8 @@ private:
 #if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
     PER_HEAP_ISOLATED_METHOD void string_dedup_note_root (uint8_t* o);
 
+    PER_HEAP_METHOD bool string_dedup_compaction_pays();
+
     PER_HEAP_METHOD void string_dedup_merge_begin();
 
     PER_HEAP_METHOD bool string_dedup_redirect (uint8_t** pold_address);

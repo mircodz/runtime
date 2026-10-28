@@ -2249,6 +2249,11 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // A GC that does not compact does not merge, and neither does one that runs while a background GC is in progress, which could not tell that
 // a redirect brings back a string of gen2 that it has not marked. The recorded pairs are dropped then.
 //
+// A gen1 GC that would sweep compacts instead when the duplicates that the finder recorded in it add up to GCStringDedupCompactMinKB or more
+// (string_dedup_compaction_pays, asked by decide_on_compacting after every other reason to compact): a sweeping GC of regions promotes the survivors
+// where they are and never looks at their references, and a duplicate that the GC that found it did not merge is never found again, because a
+// string leaves gen1 only once. A full GC is not asked to compact: what its compaction costs depends on the whole heap, not on what its duplicates are worth.
+//
 // A string that a stack, a register or a byref refers to is left out altogether (the finder does not even look it up): strings are written through
 // such references while they are built (string.Create, spans, fixed), so the string must neither be merged into another one, because the
 // written string would not be the one that the rewritten reference leads to, nor become the canonical string of its content, because the
@@ -2258,14 +2263,16 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // from its table then. The finder does not record a pair for an entry of the queue that is left from a GC that could not consume it (the table
 // could not be allocated then): it is in gen2, which a GC of gen1 does not condemn, so this GC would not see all the references to it.
 //
-// The result is reported with the StringDedupMerge GC event, once for every blocking GC that ran the finder. The payload of its version 1 is
+// The result is reported with the StringDedupMerge GC event, once for every blocking GC that ran the finder. The payload of its version 2 is
 // these uint64 values in order:
-//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 2 a background GC was in progress, 3 out of memory),
+//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 2 a background GC was in progress, whether or not the GC compacted,
+//   3 out of memory),
 //   condemned generation, duplicates that the finder recorded as pairs (all of its duplicates), candidates left out because a stack, a
 //   register or a byref refers to them, pairs dropped when they were registered, pairs that were registered, registered duplicates whose
 //   references were replaced, their size in bytes, references that were replaced, registered duplicates that no reference was found for (that
 //   must be 0, every duplicate is marked so something refers to it), time that the merge itself spent in microseconds (the cost of looking at
-//   every reference that the relocate phase relocates is in the pause only), 1 if the GC compacted and 0 if it did not.
+//   every reference that the relocate phase relocates is in the pause only), 1 if the GC compacted and 0 if it did not, the size in bytes of the
+//   duplicates that the finder recorded as pairs, 1 if the GC compacted only because string_dedup_compaction_pays asked for it.
 
 struct string_dedup_pair
 {
@@ -2290,6 +2297,8 @@ struct string_dedup_merge_stats
     uint64_t unreferenced;
     uint64_t elapsed_us;
     uint64_t compacted;
+    uint64_t pair_bytes;
+    uint64_t upgraded;
 };
 
 // What relocate_address looks at while the merge is active: the registered pairs in an open addressing table that is two thirds full at most, a pair
@@ -2869,6 +2878,7 @@ static void string_dedup_pair_add (string_dedup_queue_state* queue, uint8_t* dup
     assert (queue->pair_count < string_dedup_queue_capacity);
     queue->pairs[queue->pair_count++] = string_dedup_pair { duplicate, canonical, bytes, 0 };
     queue->merge.pairs++;
+    queue->merge.pair_bytes += bytes;
 }
 
 #endif //USE_REGIONS
@@ -3068,12 +3078,12 @@ static inline string_dedup_pair* string_dedup_redirects_find (const string_dedup
 
 static void string_dedup_merge_fire (const string_dedup_merge_stats* stats)
 {
-    if (!GCEventEnabledStringDedupMerge_V1())
+    if (!GCEventEnabledStringDedupMerge_V2())
     {
         return;
     }
 
-    GCEventFireStringDedupMerge_V1 (
+    GCEventFireStringDedupMerge_V2 (
         stats->gc_index,
         stats->status,
         stats->condemned_generation,
@@ -3086,7 +3096,9 @@ static void string_dedup_merge_fire (const string_dedup_merge_stats* stats)
         stats->references,
         stats->unreferenced,
         stats->elapsed_us,
-        stats->compacted
+        stats->compacted,
+        stats->pair_bytes,
+        stats->upgraded
     );
 }
 
@@ -3442,6 +3454,37 @@ void gc_heap::string_dedup_merge_end()
     stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
 }
 
+// Called by decide_on_compacting for a GC that is going to sweep, after every other reason to compact. A sweeping GC merges nothing, so a gen1 GC
+// compacts when the duplicates that the finder recorded in it are worth GCStringDedupCompactMinKB or more. When this returns true it has recorded
+// that the GC compacts for the merge (the report clears that if the GC did not compact after all). Not while a background GC is in progress, which
+// keeps every GC from merging.
+bool gc_heap::string_dedup_compaction_pays()
+{
+    int64_t min_kb = GCConfig::GetStringDedupCompactMinKB();
+    string_dedup_queue_state* queue = string_dedup_queue;
+    if ((min_kb <= 0) || !string_dedup_merge_enabled() || (queue == nullptr) || (queue->pairs == nullptr) || !queue->gc.report_pending)
+    {
+        return false;
+    }
+
+    string_dedup_merge_stats* stats = &queue->merge;
+    if ((settings.condemned_generation != 1) || (stats->status != 0) || ((int64_t)(stats->pair_bytes >> 10) < min_kb))
+    {
+        return false;
+    }
+
+#ifdef BACKGROUND_GC
+    if (background_running_p())
+    {
+        return false;
+    }
+#endif //BACKGROUND_GC
+
+    stats->upgraded = 1;
+
+    return true;
+}
+
 #endif //USE_REGIONS && !MULTIPLE_HEAPS
 
 // Runs after the plan phase of every non-concurrent GC.
@@ -3508,9 +3551,16 @@ void gc_heap::string_dedup_queue_report()
     {
         string_dedup_merge_stats* merge = &queue->merge;
         merge->compacted = settings.compaction ? 1 : 0;
+        // A veto that came after string_dedup_compaction_pays asked for a compaction leaves a GC that did not compact.
+        merge->upgraded &= merge->compacted;
         if (!settings.compaction && (merge->status == 0))
         {
+#ifdef BACKGROUND_GC
+            // A background GC in progress is the reason that a GC does not merge, whether it compacts (string_dedup_merge_begin) or sweeps.
+            merge->status = background_running_p() ? 2 : 1;
+#else //BACKGROUND_GC
             merge->status = 1;
+#endif //BACKGROUND_GC
         }
 
         string_dedup_merge_fire (merge);

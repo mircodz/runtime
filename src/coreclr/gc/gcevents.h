@@ -59,7 +59,7 @@ DYNAMIC_EVENT(StringDedupQueue, GCEventLevel_Information, GCEventKeyword_GC, 3)
 // The payload of StringDedupFind is described at the finder in diagnostics.cpp.
 DYNAMIC_EVENT(StringDedupFind, GCEventLevel_Information, GCEventKeyword_GC, 1)
 // The payload of StringDedupMerge is described at the merge in diagnostics.cpp.
-DYNAMIC_EVENT(StringDedupMerge, GCEventLevel_Information, GCEventKeyword_GC, 1)
+DYNAMIC_EVENT(StringDedupMerge, GCEventLevel_Information, GCEventKeyword_GC, 2)
 
 #undef KNOWN_EVENT
 #undef DYNAMIC_EVENT
