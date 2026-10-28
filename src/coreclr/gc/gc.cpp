@@ -1385,6 +1385,9 @@ CFinalize*  gc_heap::finalize_queue = 0;
 
 #ifdef FEATURE_EVENT_TRACE
 string_dedup_queue_state* gc_heap::string_dedup_queue = nullptr;
+#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+string_dedup_redirects* gc_heap::string_dedup_redirect_map = nullptr;
+#endif //USE_REGIONS && !MULTIPLE_HEAPS
 #endif //FEATURE_EVENT_TRACE
 
 #ifdef FEATURE_CARD_MARKING_STEALING

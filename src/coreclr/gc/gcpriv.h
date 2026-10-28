@@ -403,6 +403,9 @@ class seg_free_spaces;
 class gc_heap;
 #ifdef FEATURE_EVENT_TRACE
 struct string_dedup_queue_state;
+#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+struct string_dedup_redirects;
+#endif //USE_REGIONS && !MULTIPLE_HEAPS
 #endif //FEATURE_EVENT_TRACE
 
 #define youngest_generation (generation_of (0))
@@ -2190,6 +2193,15 @@ private:
 #ifdef VERIFY_HEAP
     PER_HEAP_METHOD void string_dedup_queue_verify();
 #endif //VERIFY_HEAP
+#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    PER_HEAP_ISOLATED_METHOD void string_dedup_note_root (uint8_t* o);
+
+    PER_HEAP_METHOD void string_dedup_merge_begin();
+
+    PER_HEAP_METHOD bool string_dedup_redirect (uint8_t** pold_address);
+
+    PER_HEAP_METHOD void string_dedup_merge_end();
+#endif //USE_REGIONS && !MULTIPLE_HEAPS
 #endif //FEATURE_EVENT_TRACE
 
     struct walk_relocate_args
@@ -3915,6 +3927,10 @@ private:
 #ifdef FEATURE_EVENT_TRACE
     // The strings queued as string deduplication candidates, see string_dedup_queue_after_mark.
     PER_HEAP_FIELD_MAINTAINED string_dedup_queue_state* string_dedup_queue;
+#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    // The duplicate strings whose references the relocate phase replaces, only set while it runs, see string_dedup_merge_begin.
+    PER_HEAP_ISOLATED_FIELD_MAINTAINED string_dedup_redirects* string_dedup_redirect_map;
+#endif //USE_REGIONS && !MULTIPLE_HEAPS
 #endif //FEATURE_EVENT_TRACE
 
     /******************************************/

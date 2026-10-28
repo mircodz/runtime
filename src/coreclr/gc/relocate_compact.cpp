@@ -483,7 +483,21 @@ void gc_heap::relocate_address (uint8_t** pold_address THREAD_NUMBER_DCL)
 {
     uint8_t* old_address = *pold_address;
 #ifdef USE_REGIONS
-    if (!is_in_gc_range (old_address) || !should_check_brick_for_reloc (old_address))
+    if (!is_in_gc_range (old_address))
+    {
+        return;
+    }
+
+#if defined(FEATURE_EVENT_TRACE) && !defined(MULTIPLE_HEAPS)
+    // The string deduplication merge replaces the references to a duplicate, wherever its region is: a region that is swept in plan is
+    // not relocated otherwise.
+    if ((string_dedup_redirect_map != nullptr) && string_dedup_redirect (pold_address))
+    {
+        return;
+    }
+#endif //FEATURE_EVENT_TRACE && !MULTIPLE_HEAPS
+
+    if (!should_check_brick_for_reloc (old_address))
     {
         return;
     }
@@ -724,7 +738,16 @@ void gc_heap::relocate_pre_plug_info (mark* pinned_plug_entry)
     uint8_t** old_address = &pre_plug_start;
 
     uint8_t* old_val = (old_address ? *old_address : 0);
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    // This is the address of the tail of an object that the pinned plug overwrote, not a reference. When that object is a duplicate string of 24
+    // bytes its start is this address, and the string deduplication merge would turn it into the address of the canonical string.
+    string_dedup_redirects* string_dedup_redirects_in_use = string_dedup_redirect_map;
+    string_dedup_redirect_map = nullptr;
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
     relocate_address (old_address THREAD_NUMBER_ARG);
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    string_dedup_redirect_map = string_dedup_redirects_in_use;
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
     if (old_address)
     {
         dprintf (3, ("PreR %p: %p->%p, set reloc: %p",
@@ -1461,6 +1484,10 @@ void gc_heap::relocate_phase (int condemned_gen_number,
 
     dprintf (2, (ThreadStressLog::gcStartRelocateMsg(), heap_number));
 
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    string_dedup_merge_begin();
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
+
     dprintf(3,("Relocating roots"));
     GCScan::GcScanRoots(GCHeap::Relocate,
                             condemned_gen_number, max_generation, &sc);
@@ -1605,6 +1632,10 @@ void gc_heap::relocate_phase (int condemned_gen_number,
         }
     }
 #endif // MULTIPLE_HEAPS && FEATURE_CARD_MARKING_STEALING
+
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+    string_dedup_merge_end();
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
 
     dprintf(2, (ThreadStressLog::gcEndRelocateMsg(), heap_number));
 }
