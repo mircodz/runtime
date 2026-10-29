@@ -2246,8 +2246,18 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // caller that passes the address of an object that a pinned plug overwrote, which is not a reference, so it switches the merge off around its call), and
 // string_dedup_merge_end drops the registrations.
 //
-// A GC that does not compact does not merge, and neither does one that runs while a background GC is in progress, which could not tell that
-// a redirect brings back a string of gen2 that it has not marked. The recorded pairs are dropped then.
+// A GC that does not compact does not merge. The recorded pairs are dropped then.
+//
+// A GC that runs while a background GC marks (current_c_gc_state == c_gc_state_marking) does merge, but the references that the relocate phase
+// gives a canonical string are written with plain stores, which neither the write barrier nor the write watch of the background GC see, and the
+// canonical string can be dead already (the table is pruned only by the GCs of gen2 and by the final mark of a background GC), so the sweep that
+// follows would free it behind those references. A string has no references to trace, so marking it for the background GC is all that the background
+// GC needs to know about them: it is what the background GC could have done just before this GC, and gcmemcopy carries the mark bit of every plug that
+// moves. The bit is set before anything is relocated, at the address that the string has now, and only in that state: nothing is marked while the
+// background GC sweeps (its final mark pruned the table, so every entry is alive for the sweep, and a bit set behind the sweep would stay for the next
+// background GC), nor before its marking starts (gcmemcopy does not carry bits then, and the background GC will find the references by itself). The
+// strings are marked as their pairs are registered: if the table of the redirections cannot be allocated after that, they stay marked without a
+// reference, which is floating garbage of that background GC and nothing else (its sweep clears the bits).
 //
 // A gen1 GC that would sweep compacts instead when the duplicates that the finder recorded in it add up to GCStringDedupCompactMinKB or more
 // (string_dedup_compaction_pays, asked by decide_on_compacting after every other reason to compact): a sweeping GC of regions promotes the survivors
@@ -2263,16 +2273,17 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // from its table then. The finder does not record a pair for an entry of the queue that is left from a GC that could not consume it (the table
 // could not be allocated then): it is in gen2, which a GC of gen1 does not condemn, so this GC would not see all the references to it.
 //
-// The result is reported with the StringDedupMerge GC event, once for every blocking GC that ran the finder. The payload of its version 2 is
+// The result is reported with the StringDedupMerge GC event, once for every blocking GC that ran the finder. The payload of its version 3 is
 // these uint64 values in order:
-//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 2 a background GC was in progress, whether or not the GC compacted,
-//   3 out of memory),
+//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 3 out of memory),
 //   condemned generation, duplicates that the finder recorded as pairs (all of its duplicates), candidates left out because a stack, a
 //   register or a byref refers to them, pairs dropped when they were registered, pairs that were registered, registered duplicates whose
 //   references were replaced, their size in bytes, references that were replaced, registered duplicates that no reference was found for (that
 //   must be 0, every duplicate is marked so something refers to it), time that the merge itself spent in microseconds (the cost of looking at
 //   every reference that the relocate phase relocates is in the pause only), 1 if the GC compacted and 0 if it did not, the size in bytes of the
-//   duplicates that the finder recorded as pairs, 1 if the GC compacted only because string_dedup_compaction_pays asked for it.
+//   duplicates that the finder recorded as pairs, 1 if the GC compacted only because string_dedup_compaction_pays asked for it, the state of the
+//   background GC when the GC had marked (0 it was not marking or sweeping, 1 marking, 2 sweeping), the canonical strings that the GC marked for the
+//   background GC.
 
 struct string_dedup_pair
 {
@@ -2299,6 +2310,8 @@ struct string_dedup_merge_stats
     uint64_t compacted;
     uint64_t pair_bytes;
     uint64_t upgraded;
+    uint64_t bgc;
+    uint64_t bgc_marked;
 };
 
 // What relocate_address looks at while the merge is active: the registered pairs in an open addressing table that is two thirds full at most, a pair
@@ -3078,12 +3091,12 @@ static inline string_dedup_pair* string_dedup_redirects_find (const string_dedup
 
 static void string_dedup_merge_fire (const string_dedup_merge_stats* stats)
 {
-    if (!GCEventEnabledStringDedupMerge_V2())
+    if (!GCEventEnabledStringDedupMerge_V3())
     {
         return;
     }
 
-    GCEventFireStringDedupMerge_V2 (
+    GCEventFireStringDedupMerge_V3 (
         stats->gc_index,
         stats->status,
         stats->condemned_generation,
@@ -3098,7 +3111,9 @@ static void string_dedup_merge_fire (const string_dedup_merge_stats* stats)
         stats->elapsed_us,
         stats->compacted,
         stats->pair_bytes,
-        stats->upgraded
+        stats->upgraded,
+        stats->bgc,
+        stats->bgc_marked
     );
 }
 
@@ -3187,6 +3202,11 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
         queue->merge = {};
         queue->merge.gc_index = (uint64_t)settings.gc_index;
         queue->merge.condemned_generation = (uint64_t)condemned_gen_number;
+#ifdef BACKGROUND_GC
+        // A GC that sees the background GC marking keeps seeing it (the background GC needs this GC to end before its final mark). One that sees it
+        // sweeping can see it end, which changes nothing: both mean that there is nothing to mark.
+        queue->merge.bgc = (current_c_gc_state == c_gc_state_marking) ? 1 : ((current_c_gc_state == c_gc_state_planning) ? 2 : 0);
+#endif //BACKGROUND_GC
 #endif //USE_REGIONS
 
         if ((condemned_gen_number == max_generation) && (queue->table != nullptr))
@@ -3320,7 +3340,8 @@ void gc_heap::string_dedup_note_root (uint8_t* o)
 
 // Runs at the start of the relocate phase of a GC that compacts, before any reference is relocated, and registers the pairs that can be merged.
 // The duplicate has to be in a region that this GC condemns, because only then does it see every reference to it, which holds for the strings that
-// leave gen1, and the canonical string has to end up in gen2 without being demoted, because it is removed from the table otherwise.
+// leave gen1, and the canonical string has to end up in gen2 without being demoted, because it is removed from the table otherwise. While a
+// background GC marks, every canonical string that is registered is marked for it (see the comment at the top of the merge).
 void gc_heap::string_dedup_merge_begin()
 {
     string_dedup_queue_state* queue = string_dedup_queue;
@@ -3334,15 +3355,6 @@ void gc_heap::string_dedup_merge_begin()
     {
         return;
     }
-
-#ifdef BACKGROUND_GC
-    if (background_running_p())
-    {
-        stats->status = 2;
-
-        return;
-    }
-#endif //BACKGROUND_GC
 
     if (queue->pair_count == 0)
     {
@@ -3368,6 +3380,14 @@ void gc_heap::string_dedup_merge_begin()
             {
                 last_relocated = nullptr;
             }
+#ifdef BACKGROUND_GC
+            // Only the bit is set, by address: the header of a string in front of a pinned plug can be overwritten by the plug's saved info.
+            else if ((current_c_gc_state == c_gc_state_marking) &&
+                     background_mark (last_canonical, background_saved_lowest_address, background_saved_highest_address))
+            {
+                stats->bgc_marked++;
+            }
+#endif //BACKGROUND_GC
         }
 
         uint8_t* canonical = last_relocated;
@@ -3456,8 +3476,7 @@ void gc_heap::string_dedup_merge_end()
 
 // Called by decide_on_compacting for a GC that is going to sweep, after every other reason to compact. A sweeping GC merges nothing, so a gen1 GC
 // compacts when the duplicates that the finder recorded in it are worth GCStringDedupCompactMinKB or more. When this returns true it has recorded
-// that the GC compacts for the merge (the report clears that if the GC did not compact after all). Not while a background GC is in progress, which
-// keeps every GC from merging.
+// that the GC compacts for the merge (the report clears that if the GC did not compact after all).
 bool gc_heap::string_dedup_compaction_pays()
 {
     int64_t min_kb = GCConfig::GetStringDedupCompactMinKB();
@@ -3472,13 +3491,6 @@ bool gc_heap::string_dedup_compaction_pays()
     {
         return false;
     }
-
-#ifdef BACKGROUND_GC
-    if (background_running_p())
-    {
-        return false;
-    }
-#endif //BACKGROUND_GC
 
     stats->upgraded = 1;
 
@@ -3555,15 +3567,21 @@ void gc_heap::string_dedup_queue_report()
         merge->upgraded &= merge->compacted;
         if (!settings.compaction && (merge->status == 0))
         {
-#ifdef BACKGROUND_GC
-            // A background GC in progress is the reason that a GC does not merge, whether it compacts (string_dedup_merge_begin) or sweeps.
-            merge->status = background_running_p() ? 2 : 1;
-#else //BACKGROUND_GC
             merge->status = 1;
-#endif //BACKGROUND_GC
         }
 
         string_dedup_merge_fire (merge);
+
+#if defined(BACKGROUND_GC) && defined(_DEBUG)
+        // A canonical string that was marked for the background GC has its mark bit where the compaction put it.
+        if ((merge->bgc == 1) && ((merge->status == 0) || (merge->status == 3)))
+        {
+            for (size_t i = 0; i < queue->pair_count; i++)
+            {
+                assert ((queue->pairs[i].canonical == nullptr) || background_object_marked (queue->pairs[i].canonical, FALSE));
+            }
+        }
+#endif //BACKGROUND_GC && _DEBUG
     }
 
     queue->pair_count = 0;
