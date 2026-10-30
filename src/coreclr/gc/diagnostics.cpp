@@ -2243,8 +2243,8 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // cards of the older generations) and rewrites them anyway, so the merge happens there: while it consumes the candidates the finder records
 // the pairs of a duplicate and its canonical string, string_dedup_merge_begin registers them at the start of the relocate phase,
 // relocate_address calls string_dedup_redirect for every reference it relocates before it does anything else with it (relocate_pre_plug_info is the one
-// caller that passes the address of an object that a pinned plug overwrote, which is not a reference, so it switches the merge off around its call), and
-// string_dedup_merge_end drops the registrations.
+// caller that passes the address of an object that a pinned plug overwrote, which is not a reference, so it calls relocate_address_core, which does not
+// merge), and string_dedup_merge_end drops the registrations.
 //
 // A GC that does not compact does not merge. The recorded pairs are dropped then.
 //

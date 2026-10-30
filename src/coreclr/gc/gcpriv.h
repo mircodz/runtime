@@ -3028,6 +3028,7 @@ private:
     PER_HEAP_METHOD void make_unused_array (uint8_t* x, size_t size, BOOL clearp=FALSE, BOOL resetp=FALSE);
     PER_HEAP_METHOD void clear_unused_array (uint8_t* x, size_t size);
     PER_HEAP_METHOD void relocate_address (uint8_t** old_address THREAD_NUMBER_DCL);
+    PER_HEAP_METHOD void relocate_address_core (uint8_t** old_address THREAD_NUMBER_DCL);
     struct relocate_args
     {
         uint8_t* last_plug;
