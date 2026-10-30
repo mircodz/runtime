@@ -589,12 +589,12 @@ void gc_heap::relocate_address_core (uint8_t** pold_address THREAD_NUMBER_DCL)
 // canonical string first, wherever the region of the duplicate is: a region that is swept in plan is not relocated otherwise.
 void gc_heap::relocate_address (uint8_t** pold_address THREAD_NUMBER_DCL)
 {
-#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS)
     if ((string_dedup_redirect_map != nullptr) && is_in_gc_range (*pold_address) && string_dedup_redirect (pold_address))
     {
         return;
     }
-#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS
 
     relocate_address_core (pold_address THREAD_NUMBER_ARG);
 }
@@ -1476,6 +1476,11 @@ void gc_heap::relocate_phase (int condemned_gen_number,
         verify_region_to_generation_map();
 #endif //USE_REGIONS
 
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && defined(MULTIPLE_HEAPS)
+        // Every plan is done, so this one thread registers the duplicates of all the heaps.
+        string_dedup_merge_begin();
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && MULTIPLE_HEAPS
+
 #ifdef MULTIPLE_HEAPS
         //join all threads to make sure they are synchronized
         dprintf(3, ("Restarting for relocation"));
@@ -2074,6 +2079,11 @@ void gc_heap::compact_phase (int condemned_gen_number,
             gc_time_info[time_relocate] = gc_time_info[time_compact] - gc_time_info[time_relocate];
         }
 #endif //FEATURE_EVENT_TRACE
+
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && defined(MULTIPLE_HEAPS)
+        // Every heap has relocated all its references, which is when the registrations of the duplicates end.
+        string_dedup_merge_end();
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS && MULTIPLE_HEAPS
 
 #ifdef MULTIPLE_HEAPS
         dprintf(3, ("Restarting for compaction"));

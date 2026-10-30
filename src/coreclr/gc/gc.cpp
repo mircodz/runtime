@@ -1373,6 +1373,10 @@ heap_segment* gc_heap::saved_loh_segment_no_gc = 0;
 
 #endif //MULTIPLE_HEAPS
 
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS)
+string_dedup_redirects* gc_heap::string_dedup_redirect_map = nullptr;
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS
+
 #ifndef MULTIPLE_HEAPS
 
 BOOL        gc_heap::gen0_bricks_cleared = FALSE;
@@ -1385,9 +1389,9 @@ CFinalize*  gc_heap::finalize_queue = 0;
 
 #ifdef FEATURE_EVENT_TRACE
 string_dedup_queue_state* gc_heap::string_dedup_queue = nullptr;
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
-string_dedup_redirects* gc_heap::string_dedup_redirect_map = nullptr;
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#ifdef USE_REGIONS
+string_dedup_rooted_set* gc_heap::string_dedup_roots = nullptr;
+#endif //USE_REGIONS
 #endif //FEATURE_EVENT_TRACE
 
 #ifdef FEATURE_CARD_MARKING_STEALING
@@ -3317,6 +3321,9 @@ gc_heap::init_gc_heap (int h_number)
 
 #ifdef FEATURE_EVENT_TRACE
     string_dedup_queue = nullptr;
+#ifdef USE_REGIONS
+    string_dedup_roots = nullptr;
+#endif //USE_REGIONS
 #endif //FEATURE_EVENT_TRACE
 
     condemned_generation_num = 0;

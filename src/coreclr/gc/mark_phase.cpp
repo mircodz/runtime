@@ -3031,6 +3031,11 @@ void gc_heap::mark_phase (int condemned_gen_number)
         GCScan::GcScanRoots(GCHeap::Promote,
                                 condemned_gen_number, max_generation,
                                 &sc);
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS)
+        // The scan leaves the last thread that it scanned as the thread under crawl in every heap that does not scan the unpinned roots (all but heap 0 of a
+        // server GC), and the roots of the handles that follow are no stack roots: GCHeap::Promote would note their strings (string_dedup_note_root).
+        sc.thread_under_crawl = nullptr;
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS
         drain_mark_queue();
         fire_mark_event (ETW::GC_ROOT_STACK, current_promoted_bytes, last_promoted_bytes);
 

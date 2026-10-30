@@ -8133,13 +8133,13 @@ BOOL gc_heap::decide_on_compacting (int condemned_gen_number,
         }
     }
 
-#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS)
     // Nothing else wants to compact: compact when the duplicate strings that the finder found are worth it.
     if (!should_compact && string_dedup_compaction_pays())
     {
         should_compact = TRUE;
     }
-#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS
 
     dprintf (2, ("will %s(%s)", (should_compact ? "compact" : "sweep"), (should_expand ? "ex" : "")));
     return should_compact;

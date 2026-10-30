@@ -1064,13 +1064,13 @@ void GCHeap::Promote(Object** ppObject, ScanContext* sc, uint32_t flags)
         }
     }
 
-#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#if defined(FEATURE_EVENT_TRACE) && defined(USE_REGIONS)
     // A string that a stack, a register or a byref refers to can be under construction, the string deduplication merge must leave it alone.
     if ((sc->thread_under_crawl != nullptr) || (flags & GC_CALL_INTERIOR))
     {
-        gc_heap::string_dedup_note_root (o);
+        gc_heap::string_dedup_note_root (o, sc->thread_number);
     }
-#endif //FEATURE_EVENT_TRACE && USE_REGIONS && !MULTIPLE_HEAPS
+#endif //FEATURE_EVENT_TRACE && USE_REGIONS
 
 #ifdef FEATURE_CONSERVATIVE_GC
     // For conservative GC, a value on stack may point to middle of a free object.

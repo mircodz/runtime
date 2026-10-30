@@ -2239,9 +2239,9 @@ const int string_dedup_table_max_bits = 24;
 static_assert (string_dedup_table_initial_capacity <= ((((size_t)1 << string_dedup_table_min_bits) / 4) * 3), "The table must not start larger than its smallest allowed size");
 static_assert (string_dedup_table_max_bits <= 30, "The table must stay within what 32 bits can count");
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
 
-// Merge (GCStringDedupMerge, regions and workstation GC only): a GC that compacts replaces every reference to a duplicate by a reference to
+// Merge (GCStringDedupMerge, regions only): a GC that compacts replaces every reference to a duplicate by a reference to
 // its canonical string, so nothing refers to the duplicate anymore and the next gen2 GC reclaims it (the duplicate itself is still planned and
 // compacted like any survivor). For a duplicate it is all or nothing: a reference that is left behind makes two references that were the same
 // object different ones. Only the relocate phase of a compacting GC visits every reference (the roots, the survivors, the handles and the
@@ -2252,6 +2252,12 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 // merge), and string_dedup_merge_end drops the registrations.
 //
 // A GC that does not compact does not merge. The recorded pairs are dropped then.
+//
+// In a server GC the heaps share what the merge needs, which the queue of heap 0 keeps: one thread consumes the candidates of all the heaps and records the
+// pairs (the strings that the roots of every heap noted are moved into one set before that), one thread registers them in the join that starts the relocate
+// phase and publishes the table of the redirections, which every thread reads, the threads of all the heaps replace references and count them with atomic
+// additions, and one thread drops the registrations in the join that ends the relocate phase. A server GC does not merge while a background GC marks or
+// sweeps yet, it reports status 4 then.
 //
 // A GC that runs while a background GC marks (current_c_gc_state == c_gc_state_marking) does merge, but the references that the relocate phase
 // gives a canonical string are written with plain stores, which neither the write barrier nor the write watch of the background GC see, and the
@@ -2280,7 +2286,8 @@ static_assert (string_dedup_table_max_bits <= 30, "The table must stay within wh
 //
 // The result is reported with the StringDedupMerge GC event, once for every blocking GC that ran the finder. The payload of its version 3 is
 // these uint64 values in order:
-//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 3 out of memory),
+//   GC index, status (0 the relocate phase ran, 1 the GC did not compact, 3 out of memory, 4 the GC overlapped a background GC, which a server GC
+//   does not merge during yet: the duplicates were found and not registered),
 //   condemned generation, duplicates that the finder recorded as pairs (all of its duplicates), candidates left out because a stack, a
 //   register or a byref refers to them, pairs dropped when they were registered, pairs that were registered, registered duplicates whose
 //   references were replaced, their size in bytes, references that were replaced, registered duplicates that no reference was found for (that
@@ -2332,10 +2339,10 @@ struct string_dedup_redirects
     size_t filter_capacity;
 };
 
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 
-// The queue of one heap with the statistics of the GC in progress. In a server GC the table of the finder and its statistics are in the queue of heap 0,
-// which is the only one that uses them.
+// The queue of one heap with the statistics of the GC in progress. In a server GC the table of the finder and its statistics, and the state of the merge,
+// are in the queue of heap 0, which is the only one that uses them.
 struct string_dedup_queue_state
 {
     string_dedup_candidate* entries;
@@ -2344,12 +2351,13 @@ struct string_dedup_queue_state
     string_dedup_queue_stats gc;
     string_dedup_table* table;
     string_dedup_find_stats find;
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
     string_dedup_pair* pairs; // the duplicates that the GC in progress found, nullptr when the merge is off
+    size_t pair_capacity;
     size_t pair_count;
     string_dedup_merge_stats merge;
     string_dedup_redirects redirects;
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 };
 
 #ifdef MULTIPLE_HEAPS
@@ -2358,14 +2366,14 @@ const size_t string_dedup_queue_capacity = (size_t)1 << 14;
 const size_t string_dedup_queue_capacity = (size_t)1 << 16;
 #endif //MULTIPLE_HEAPS
 
-// The merge works on the pairs that the finder records, so it implies the finder, and it needs regions and a workstation GC.
+// The merge works on the pairs that the finder records, so it implies the finder, and it needs regions.
 static inline bool string_dedup_merge_enabled()
 {
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
     return GCConfig::GetStringDedupMerge() != 0;
-#else //USE_REGIONS && !MULTIPLE_HEAPS
+#else //USE_REGIONS
     return false;
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 }
 
 // A server GC needs regions: the table is checked for the strings that the GC demoted by one thread once the generations of the regions of all the heaps
@@ -2458,6 +2466,22 @@ static uint64_t string_dedup_signature (CObjectHeader* str)
     return ((uint64_t)length << 32) | first_chars;
 }
 
+#ifdef USE_REGIONS
+// Makes room for 'count' pairs of the GC in progress. Every candidate leads to at most one pair, so the candidates of the queues that are consumed set the
+// size, and the pairs of an earlier GC are not needed anymore. Returns false when memory ran out.
+static bool string_dedup_pairs_reserve (string_dedup_queue_state* owner, size_t count)
+{
+    if (owner->pair_capacity < count)
+    {
+        delete[] owner->pairs;
+        owner->pairs = new (nothrow) string_dedup_pair[count];
+        owner->pair_capacity = (owner->pairs != nullptr) ? count : 0;
+    }
+
+    return owner->pairs != nullptr;
+}
+#endif //USE_REGIONS
+
 static bool string_dedup_queue_reserve (string_dedup_queue_state* queue)
 {
     if (queue->entries == nullptr)
@@ -2466,10 +2490,9 @@ static bool string_dedup_queue_reserve (string_dedup_queue_state* queue)
     }
 
 #if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
-    // Every candidate leads to at most one pair, so the pairs never need more room than the queue.
-    if ((queue->pairs == nullptr) && string_dedup_merge_enabled())
+    if (string_dedup_merge_enabled())
     {
-        queue->pairs = new (nothrow) string_dedup_pair[string_dedup_queue_capacity];
+        string_dedup_pairs_reserve (queue, string_dedup_queue_capacity);
     }
 #endif //USE_REGIONS && !MULTIPLE_HEAPS
 
@@ -2779,7 +2802,7 @@ static size_t string_dedup_table_added_start (const string_dedup_table* table, c
     return table->count - (size_t)stats->added;
 }
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
 
 // The slot where the search for a pointer starts in a table of 'mask + 1' slots, a power of two.
 static inline size_t string_dedup_pointer_slot (uint8_t* p, size_t mask)
@@ -2787,8 +2810,10 @@ static inline size_t string_dedup_pointer_slot (uint8_t* p, size_t mask)
     return (size_t)(((uint64_t)(size_t)p * 0x9E3779B97F4A7C15ull) >> 32) & mask;
 }
 
-// The strings that a stack, a register or a byref refers to, noted by GCHeap::Promote while the GC marks. The set is empty after every GC that
-// ran the finder, so it only holds what the GC in progress has seen. When memory runs out some of them are not in it and the GC does not merge.
+// The strings that a stack, a register or a byref refers to, noted by GCHeap::Promote while the GC marks. Every heap has its own set for the roots that it
+// scans, so the threads do not share one while they mark, and a server GC moves them into the set of heap 0 before it consumes the candidates. The sets
+// are empty after every GC that ran the finder, so they only hold what the GC in progress has seen. When memory runs out some of them are not in them, which
+// string_dedup_roots_incomplete remembers, and the GC does not merge.
 struct string_dedup_rooted_set
 {
     uint8_t** slots;    // nullptr for an empty slot
@@ -2797,11 +2822,10 @@ struct string_dedup_rooted_set
     bool incomplete;
 };
 
-static string_dedup_rooted_set string_dedup_rooted;
+static bool string_dedup_roots_incomplete;
 
-static void string_dedup_rooted_add (uint8_t* o)
+static void string_dedup_rooted_add (string_dedup_rooted_set* set, uint8_t* o)
 {
-    string_dedup_rooted_set* set = &string_dedup_rooted;
     if ((set->count + 1) * 2 > set->slot_count)
     {
         size_t slot_count = (set->slot_count == 0) ? 1024 : (set->slot_count * 2);
@@ -2848,10 +2872,10 @@ static void string_dedup_rooted_add (uint8_t* o)
     set->count++;
 }
 
-static bool string_dedup_rooted_contains (uint8_t* o)
+// A heap that has not noted a string has no set.
+static bool string_dedup_rooted_contains (const string_dedup_rooted_set* set, uint8_t* o)
 {
-    string_dedup_rooted_set* set = &string_dedup_rooted;
-    if (set->count == 0)
+    if ((set == nullptr) || (set->count == 0))
     {
         return false;
     }
@@ -2868,9 +2892,13 @@ static bool string_dedup_rooted_contains (uint8_t* o)
 }
 
 // Empties the set. A set that has grown large is given back, a GC with many roots is rare.
-static void string_dedup_rooted_clear()
+static void string_dedup_rooted_clear (string_dedup_rooted_set* set)
 {
-    string_dedup_rooted_set* set = &string_dedup_rooted;
+    if (set == nullptr)
+    {
+        return;
+    }
+
     if (set->slot_count > ((size_t)1 << 16))
     {
         delete[] set->slots;
@@ -2886,40 +2914,62 @@ static void string_dedup_rooted_clear()
     set->incomplete = false;
 }
 
-// Records that 'duplicate' has the content of the canonical string. There is room for a pair for every candidate of the queue.
-static void string_dedup_pair_add (string_dedup_queue_state* queue, uint8_t* duplicate, uint8_t* canonical, size_t bytes)
+#ifdef MULTIPLE_HEAPS
+// Moves the strings of 'from' into 'into', which both exist.
+static void string_dedup_rooted_move (string_dedup_rooted_set* into, string_dedup_rooted_set* from)
 {
-    if ((queue->pairs == nullptr) || string_dedup_rooted.incomplete)
+    for (size_t i = 0; i < from->slot_count; i++)
+    {
+        if (from->slots[i] != nullptr)
+        {
+            string_dedup_rooted_add (into, from->slots[i]);
+        }
+    }
+
+    into->incomplete |= from->incomplete;
+    string_dedup_rooted_clear (from);
+}
+#endif //MULTIPLE_HEAPS
+
+// Records that 'duplicate' has the content of the canonical string. There is room for a pair for every candidate that is consumed.
+static void string_dedup_pair_add (string_dedup_queue_state* owner, uint8_t* duplicate, uint8_t* canonical, size_t bytes)
+{
+    if ((owner->pairs == nullptr) || (owner->merge.status == 3))
     {
         return;
     }
 
-    assert (queue->pair_count < string_dedup_queue_capacity);
-    queue->pairs[queue->pair_count++] = string_dedup_pair { duplicate, canonical, bytes, 0 };
-    queue->merge.pairs++;
-    queue->merge.pair_bytes += bytes;
+    assert (owner->pair_count < owner->pair_capacity);
+    owner->pairs[owner->pair_count++] = string_dedup_pair { duplicate, canonical, bytes, 0 };
+    owner->merge.pairs++;
+    owner->merge.pair_bytes += bytes;
 }
 
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 
-// Takes the candidates out of the queue. A string whose content is not in the table becomes the canonical string for it, any other string
-// is a duplicate of the canonical one.
-static void string_dedup_find_consume (string_dedup_queue_state* queue, string_dedup_table* table, string_dedup_find_stats* stats)
+struct string_dedup_rooted_set;
+
+// Takes the candidates out of the queue 'source'. A string whose content is not in the table of the queue 'owner' becomes the canonical string for it,
+// any other string is a duplicate of the canonical one. The two are the same queue unless a server GC shares the table. 'roots' are the strings that
+// the roots lead to, nullptr when there are none.
+static void string_dedup_find_consume (string_dedup_queue_state* source, string_dedup_queue_state* owner, string_dedup_rooted_set* roots)
 {
-    for (size_t i = 0; i < queue->count; i++)
+    string_dedup_table* table = owner->table;
+    string_dedup_find_stats* stats = &owner->find;
+    for (size_t i = 0; i < source->count; i++)
     {
-        CObjectHeader* str = (CObjectHeader*)queue->entries[i].obj;
+        CObjectHeader* str = (CObjectHeader*)source->entries[i].obj;
         stats->candidates++;
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
         // A string that a stack, a register or a byref refers to can be under construction. It is not merged into another string, and it does
         // not become the canonical string of its content either, because the references that are merged into it would see it change.
-        if ((queue->pairs != nullptr) && string_dedup_rooted_contains ((uint8_t*)str))
+        if ((owner->pairs != nullptr) && string_dedup_rooted_contains (roots, (uint8_t*)str))
         {
-            queue->merge.skipped_rooted++;
+            owner->merge.skipped_rooted++;
             continue;
         }
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
         // The identity of the string may have become observable since it was queued.
         if (string_dedup_header_has_state (str))
         {
@@ -2938,18 +2988,27 @@ static void string_dedup_find_consume (string_dedup_queue_state* queue, string_d
                 size_t bytes = Align (size ((uint8_t*)str));
                 stats->duplicates++;
                 stats->duplicate_bytes += bytes;
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
                 // The entries from before 'first_new' are left from a GC that could not consume them, they are in gen2 and a gen1 GC does not see all
                 // the references to them.
-                if (i >= queue->first_new)
+                if (i >= source->first_new)
                 {
-                    string_dedup_pair_add (queue, (uint8_t*)str, table->strings[canonical->entry - 1], bytes);
+                    string_dedup_pair_add (owner, (uint8_t*)str, table->strings[canonical->entry - 1], bytes);
                 }
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
             }
 
             continue;
         }
+
+#ifdef USE_REGIONS
+        // When the strings that the roots refer to could not all be noted (status 3) any string can be under construction: nothing becomes canonical.
+        if (owner->merge.status == 3)
+        {
+            stats->not_added++;
+            continue;
+        }
+#endif //USE_REGIONS
 
         // Making room moves the slots, then the one that is free has to be searched again.
         if (table->count == table->capacity)
@@ -2972,7 +3031,7 @@ static void string_dedup_find_consume (string_dedup_queue_state* queue, string_d
         stats->added++;
     }
 
-    queue->count = 0;
+    source->count = 0;
 }
 
 static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t table_size)
@@ -3000,7 +3059,7 @@ static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t
     );
 }
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
 
 // The first slot of the search for a duplicate in a table of 'slot_count' slots. The strings of a size are at a regular distance, which a plain
 // multiplication turns into clusters for some distances, so the high bits are folded into the low ones, which are reduced to the range by multiplying
@@ -3123,7 +3182,7 @@ static void string_dedup_merge_fire (const string_dedup_merge_stats* stats)
     );
 }
 
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 
 // Starts the statistics of the finder for a GC that condemns gen1 or gen2, and removes the strings that died from the table, which only a GC that
 // condemns gen2 can tell. 'owner' is the queue that has the table.
@@ -3144,7 +3203,8 @@ static void string_dedup_find_start (string_dedup_queue_state* owner, uint64_t g
 
 // Runs right after marking in a blocking GC that condemns gen1, when the queue has been filled and the plan phase has not changed anything. It
 // consumes the candidates of the queue 'source' into the table of the queue 'owner', which is the same queue unless a server GC shares the table.
-static void string_dedup_find_after_mark (string_dedup_queue_state* owner, string_dedup_queue_state* source)
+// 'roots' are the strings that the roots lead to, nullptr when there are none.
+static void string_dedup_find_after_mark (string_dedup_queue_state* owner, string_dedup_queue_state* source, string_dedup_rooted_set* roots)
 {
     string_dedup_find_stats* stats = &owner->find;
     uint64_t start_time = GetHighPrecisionTimeStamp();
@@ -3160,7 +3220,7 @@ static void string_dedup_find_after_mark (string_dedup_queue_state* owner, strin
     }
     else
     {
-        string_dedup_find_consume (source, owner->table, stats);
+        string_dedup_find_consume (source, owner, roots);
 
         // This also consumed the entries that an earlier GC could not, because the table could not be created then, so none is old anymore.
         source->first_new = 0;
@@ -3192,6 +3252,15 @@ static void string_dedup_find_report (string_dedup_queue_state* queue, bool queu
 bool gc_heap::string_dedup_queue_enabled()
 {
     return GCConfig::GetStringDedupQueue() || string_dedup_find_enabled();
+}
+
+string_dedup_queue_state* gc_heap::string_dedup_owner()
+{
+#ifdef MULTIPLE_HEAPS
+    return g_heaps[0]->string_dedup_queue;
+#else //MULTIPLE_HEAPS
+    return string_dedup_queue;
+#endif //MULTIPLE_HEAPS
 }
 
 // Runs right after marking in a blocking GC that condemns gen1.
@@ -3261,13 +3330,16 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
             if (string_dedup_find_enabled())
             {
 #ifdef USE_REGIONS
-                if (string_dedup_merge_enabled() && ((queue->pairs == nullptr) || string_dedup_rooted.incomplete))
+                string_dedup_rooted_set* roots = string_dedup_roots;
+                if (string_dedup_merge_enabled() && ((queue->pairs == nullptr) || string_dedup_roots_incomplete || ((roots != nullptr) && roots->incomplete)))
                 {
                     queue->merge.status = 3;
                 }
+#else //USE_REGIONS
+                string_dedup_rooted_set* roots = nullptr;
 #endif //USE_REGIONS
 
-                string_dedup_find_after_mark (queue, queue);
+                string_dedup_find_after_mark (queue, queue, roots);
             }
 #endif //!MULTIPLE_HEAPS
         }
@@ -3275,7 +3347,8 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
 
 #if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
     // The strings that the roots noted have been used by now.
-    string_dedup_rooted_clear();
+    string_dedup_rooted_clear (string_dedup_roots);
+    string_dedup_roots_incomplete = false;
 #endif //USE_REGIONS && !MULTIPLE_HEAPS
 
 #ifdef MULTIPLE_HEAPS
@@ -3285,23 +3358,83 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
     if (gc_t_join.joined())
     {
         // The finder has one table for all the heaps, which belongs to the queue of heap 0. This thread consumes the queues of all the heaps while the other
-        // threads wait, in the order of the heaps, and the marks are final.
-        if (string_dedup_find_enabled())
+        // threads wait, in the order of the heaps, and the marks are final. The strings that the roots of the heaps noted are in one set for the merge.
+        string_dedup_queue_state* owner = string_dedup_owner();
+        if (string_dedup_find_enabled() && (owner != nullptr))
         {
-            string_dedup_queue_state* owner = g_heaps[0]->string_dedup_queue;
-            if (owner != nullptr)
+            string_dedup_find_start (owner, (uint64_t)settings.gc_index, condemned_gen_number);
+
+#ifdef USE_REGIONS
+            string_dedup_rooted_set* roots = g_heaps[0]->string_dedup_roots;
+            if (string_dedup_merge_enabled())
             {
-                string_dedup_find_start (owner, (uint64_t)settings.gc_index, condemned_gen_number);
+                owner->pair_count = 0;
+                owner->merge = {};
+                owner->merge.gc_index = (uint64_t)settings.gc_index;
+                owner->merge.condemned_generation = (uint64_t)condemned_gen_number;
+#ifdef BACKGROUND_GC
+                owner->merge.bgc = (current_c_gc_state == c_gc_state_marking) ? 1 : ((current_c_gc_state == c_gc_state_planning) ? 2 : 0);
+#endif //BACKGROUND_GC
+
+                size_t candidates = 0;
                 for (int i = 0; i < n_heaps; i++)
                 {
                     string_dedup_queue_state* source = g_heaps[i]->string_dedup_queue;
-                    if (source != nullptr)
+                    candidates += (source != nullptr) ? source->count : 0;
+
+                    string_dedup_rooted_set* from = (i == 0) ? nullptr : g_heaps[i]->string_dedup_roots;
+                    if (from != nullptr)
                     {
-                        string_dedup_find_after_mark (owner, source);
+                        if (roots == nullptr)
+                        {
+                            roots = new (nothrow) string_dedup_rooted_set();
+                            g_heaps[0]->string_dedup_roots = roots;
+                        }
+
+                        if (roots != nullptr)
+                        {
+                            string_dedup_rooted_move (roots, from);
+                        }
+                        else
+                        {
+                            string_dedup_roots_incomplete = true;
+                        }
                     }
+                }
+
+                if (!string_dedup_pairs_reserve (owner, candidates + 1) || string_dedup_roots_incomplete || ((roots != nullptr) && roots->incomplete))
+                {
+                    owner->merge.status = 3;
+                }
+                else if (owner->merge.bgc != 0)
+                {
+                    // The merge of a server GC does not mark the canonical strings for a background GC yet, so a GC that overlaps one does not merge.
+                    owner->merge.status = 4;
+                }
+            }
+#else //USE_REGIONS
+            string_dedup_rooted_set* roots = nullptr;
+#endif //USE_REGIONS
+
+            for (int i = 0; i < n_heaps; i++)
+            {
+                string_dedup_queue_state* source = g_heaps[i]->string_dedup_queue;
+                if (source != nullptr)
+                {
+                    string_dedup_find_after_mark (owner, source, roots);
                 }
             }
         }
+
+#ifdef USE_REGIONS
+        // The strings that the roots noted have been used by now, whatever happened above.
+        for (int i = 0; i < n_heaps; i++)
+        {
+            string_dedup_rooted_clear (g_heaps[i]->string_dedup_roots);
+        }
+
+        string_dedup_roots_incomplete = false;
+#endif //USE_REGIONS
 
         gc_t_join.restart();
     }
@@ -3351,10 +3484,11 @@ void gc_heap::string_dedup_queue_relocate()
     }
 }
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
 
-// Called by GCHeap::Promote for the roots that are on a stack or in a register and for every byref, with the object that they lead to.
-void gc_heap::string_dedup_note_root (uint8_t* o)
+// Called by GCHeap::Promote for the roots that are on a stack or in a register and for every byref, with the object that they lead to. The thread of every
+// heap notes what it finds in a set of its heap, so the threads of a server GC do not share one.
+void gc_heap::string_dedup_note_root (uint8_t* o, int thread_number)
 {
     // A GC that does not condemn gen1 does not look for duplicates.
     if (!string_dedup_merge_enabled() || (settings.condemned_generation < 1) || !string_dedup_is_string (((CObjectHeader*)o)->GetMethodTable()))
@@ -3362,16 +3496,42 @@ void gc_heap::string_dedup_note_root (uint8_t* o)
         return;
     }
 
-    string_dedup_rooted_add (o);
+#ifdef MULTIPLE_HEAPS
+    if ((thread_number < 0) || (thread_number >= n_heaps))
+    {
+        string_dedup_roots_incomplete = true;
+
+        return;
+    }
+
+    string_dedup_rooted_set** set = &g_heaps[thread_number]->string_dedup_roots;
+#else //MULTIPLE_HEAPS
+    UNREFERENCED_PARAMETER (thread_number);
+    string_dedup_rooted_set** set = &string_dedup_roots;
+#endif //MULTIPLE_HEAPS
+    if (*set == nullptr)
+    {
+        *set = new (nothrow) string_dedup_rooted_set();
+        if (*set == nullptr)
+        {
+            string_dedup_roots_incomplete = true;
+
+            return;
+        }
+    }
+
+    string_dedup_rooted_add (*set, o);
 }
 
-// Runs at the start of the relocate phase of a GC that compacts, before any reference is relocated, and registers the pairs that can be merged.
+// Runs at the start of the relocate phase of a GC that compacts, before any reference is relocated, and registers the pairs that can be merged. In a server
+// GC one thread does it for all the heaps while the others wait, once every plan is done.
 // The duplicate has to be in a region that this GC condemns, because only then does it see every reference to it, which holds for the strings that
 // leave gen1, and the canonical string has to end up in gen2 without being demoted, because it is removed from the table otherwise. While a
 // background GC marks, every canonical string that is registered is marked for it (see the comment at the top of the merge).
 void gc_heap::string_dedup_merge_begin()
 {
-    string_dedup_queue_state* queue = string_dedup_queue;
+    THREAD_FROM_HEAP;
+    string_dedup_queue_state* queue = string_dedup_owner();
     if ((queue == nullptr) || (queue->pairs == nullptr) || !queue->gc.report_pending)
     {
         return;
@@ -3402,7 +3562,7 @@ void gc_heap::string_dedup_merge_begin()
         {
             last_canonical = pair->canonical;
             last_relocated = last_canonical;
-            relocate_address (&last_relocated);
+            relocate_address (&last_relocated THREAD_NUMBER_ARG);
             if ((get_region_plan_gen_num (last_relocated) != max_generation) || is_region_demoted (last_relocated))
             {
                 last_relocated = nullptr;
@@ -3457,13 +3617,18 @@ bool gc_heap::string_dedup_redirect (uint8_t** pold_address)
     }
 
     *pold_address = pair->canonical;
+#ifdef MULTIPLE_HEAPS
+    // The threads of all the heaps replace references, and any of them can find one to the same duplicate.
+    Interlocked::ExchangeAddPtr (&pair->references, (size_t)1);
+#else //MULTIPLE_HEAPS
     pair->references++;
+#endif //MULTIPLE_HEAPS
 
     return true;
 }
 
 // Runs at the end of the relocate phase of a GC that compacts: the references are replaced, so the registrations are dropped and the
-// duplicates are counted.
+// duplicates are counted. In a server GC one thread does it for all the heaps, once all of them are done relocating.
 void gc_heap::string_dedup_merge_end()
 {
     string_dedup_redirects* map = string_dedup_redirect_map;
@@ -3474,7 +3639,7 @@ void gc_heap::string_dedup_merge_end()
 
     string_dedup_redirect_map = nullptr;
 
-    string_dedup_queue_state* queue = string_dedup_queue;
+    string_dedup_queue_state* queue = string_dedup_owner();
     string_dedup_merge_stats* stats = &queue->merge;
     uint64_t start_time = GetHighPrecisionTimeStamp();
 
@@ -3507,7 +3672,7 @@ void gc_heap::string_dedup_merge_end()
 bool gc_heap::string_dedup_compaction_pays()
 {
     int64_t min_kb = GCConfig::GetStringDedupCompactMinKB();
-    string_dedup_queue_state* queue = string_dedup_queue;
+    string_dedup_queue_state* queue = string_dedup_owner();
     if ((min_kb <= 0) || !string_dedup_merge_enabled() || (queue == nullptr) || (queue->pairs == nullptr) || !queue->gc.report_pending)
     {
         return false;
@@ -3524,7 +3689,36 @@ bool gc_heap::string_dedup_compaction_pays()
     return true;
 }
 
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+// Runs after the plan phase of a GC that ran the finder: reports whether the GC compacted and fires the StringDedupMerge event. 'owner' is the queue that has
+// the state of the merge.
+void gc_heap::string_dedup_merge_report (string_dedup_queue_state* owner)
+{
+    string_dedup_merge_stats* merge = &owner->merge;
+    merge->compacted = settings.compaction ? 1 : 0;
+    // A veto that came after string_dedup_compaction_pays asked for a compaction leaves a GC that did not compact.
+    merge->upgraded &= merge->compacted;
+    if (!settings.compaction && (merge->status == 0))
+    {
+        merge->status = 1;
+    }
+
+    string_dedup_merge_fire (merge);
+
+#if defined(BACKGROUND_GC) && defined(_DEBUG)
+    // A canonical string that was marked for the background GC has its mark bit where the compaction put it.
+    if ((merge->bgc == 1) && ((merge->status == 0) || (merge->status == 3)))
+    {
+        for (size_t i = 0; i < owner->pair_count; i++)
+        {
+            assert ((owner->pairs[i].canonical == nullptr) || background_object_marked (owner->pairs[i].canonical, FALSE));
+        }
+    }
+#endif //BACKGROUND_GC && _DEBUG
+
+    owner->pair_count = 0;
+}
+
+#endif //USE_REGIONS
 
 // Runs after the plan phase of every non-concurrent GC.
 void gc_heap::string_dedup_queue_report()
@@ -3538,10 +3732,17 @@ void gc_heap::string_dedup_queue_report()
         gc_t_join.join (this, gc_join_string_dedup_report);
         if (gc_t_join.joined())
         {
-            string_dedup_queue_state* owner = g_heaps[0]->string_dedup_queue;
+            string_dedup_queue_state* owner = string_dedup_owner();
             if (owner != nullptr)
             {
-                string_dedup_find_report (owner, owner->gc.report_pending, (settings.condemned_generation == max_generation));
+                bool owner_queued = owner->gc.report_pending;
+                string_dedup_find_report (owner, owner_queued, (settings.condemned_generation == max_generation));
+#ifdef USE_REGIONS
+                if (owner_queued && string_dedup_merge_enabled())
+                {
+                    string_dedup_merge_report (owner);
+                }
+#endif //USE_REGIONS
             }
 
             gc_t_join.restart();
@@ -3608,30 +3809,8 @@ void gc_heap::string_dedup_queue_report()
 #ifdef USE_REGIONS
     if (queued && string_dedup_merge_enabled())
     {
-        string_dedup_merge_stats* merge = &queue->merge;
-        merge->compacted = settings.compaction ? 1 : 0;
-        // A veto that came after string_dedup_compaction_pays asked for a compaction leaves a GC that did not compact.
-        merge->upgraded &= merge->compacted;
-        if (!settings.compaction && (merge->status == 0))
-        {
-            merge->status = 1;
-        }
-
-        string_dedup_merge_fire (merge);
-
-#if defined(BACKGROUND_GC) && defined(_DEBUG)
-        // A canonical string that was marked for the background GC has its mark bit where the compaction put it.
-        if ((merge->bgc == 1) && ((merge->status == 0) || (merge->status == 3)))
-        {
-            for (size_t i = 0; i < queue->pair_count; i++)
-            {
-                assert ((queue->pairs[i].canonical == nullptr) || background_object_marked (queue->pairs[i].canonical, FALSE));
-            }
-        }
-#endif //BACKGROUND_GC && _DEBUG
+        string_dedup_merge_report (queue);
     }
-
-    queue->pair_count = 0;
 #endif //USE_REGIONS
 #endif //!MULTIPLE_HEAPS
 
@@ -3833,13 +4012,13 @@ void gc_heap::string_dedup_queue_verify()
         string_dedup_table_verify (queue->table);
     }
 
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
     // The merge registers duplicates only while the relocate phase runs, and the strings that the roots note are consumed right after marking.
-    if ((string_dedup_redirect_map != nullptr) || (string_dedup_rooted.count != 0))
+    if ((string_dedup_redirect_map != nullptr) || ((string_dedup_roots != nullptr) && (string_dedup_roots->count != 0)))
     {
         FATAL_GC_ERROR();
     }
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 }
 #endif //VERIFY_HEAP
 

@@ -403,9 +403,10 @@ class seg_free_spaces;
 class gc_heap;
 #ifdef FEATURE_EVENT_TRACE
 struct string_dedup_queue_state;
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
 struct string_dedup_redirects;
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+struct string_dedup_rooted_set;
+#endif //USE_REGIONS
 #endif //FEATURE_EVENT_TRACE
 
 #define youngest_generation (generation_of (0))
@@ -2179,6 +2180,9 @@ private:
 #ifdef FEATURE_EVENT_TRACE
     PER_HEAP_ISOLATED_METHOD bool string_dedup_queue_enabled();
 
+    // The queue that has the table of the finder and the state of the merge of the GC in progress: the one of heap 0 in a server GC.
+    PER_HEAP_ISOLATED_METHOD string_dedup_queue_state* string_dedup_owner();
+
     PER_HEAP_METHOD void string_dedup_queue_after_mark (int condemned_gen_number);
 
     PER_HEAP_METHOD void string_dedup_queue_relocate();
@@ -2193,8 +2197,8 @@ private:
 #ifdef VERIFY_HEAP
     PER_HEAP_METHOD void string_dedup_queue_verify();
 #endif //VERIFY_HEAP
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
-    PER_HEAP_ISOLATED_METHOD void string_dedup_note_root (uint8_t* o);
+#ifdef USE_REGIONS
+    PER_HEAP_ISOLATED_METHOD void string_dedup_note_root (uint8_t* o, int thread_number);
 
     PER_HEAP_METHOD bool string_dedup_compaction_pays();
 
@@ -2203,7 +2207,9 @@ private:
     PER_HEAP_METHOD bool string_dedup_redirect (uint8_t** pold_address);
 
     PER_HEAP_METHOD void string_dedup_merge_end();
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+
+    PER_HEAP_METHOD void string_dedup_merge_report (string_dedup_queue_state* owner);
+#endif //USE_REGIONS
 #endif //FEATURE_EVENT_TRACE
 
     struct walk_relocate_args
@@ -3930,10 +3936,12 @@ private:
 #ifdef FEATURE_EVENT_TRACE
     // The strings queued as string deduplication candidates, see string_dedup_queue_after_mark.
     PER_HEAP_FIELD_MAINTAINED string_dedup_queue_state* string_dedup_queue;
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
+#ifdef USE_REGIONS
+    // The strings that the roots that this heap scans lead to, see string_dedup_note_root.
+    PER_HEAP_FIELD_MAINTAINED string_dedup_rooted_set* string_dedup_roots;
     // The duplicate strings whose references the relocate phase replaces, only set while it runs, see string_dedup_merge_begin.
     PER_HEAP_ISOLATED_FIELD_MAINTAINED string_dedup_redirects* string_dedup_redirect_map;
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
+#endif //USE_REGIONS
 #endif //FEATURE_EVENT_TRACE
 
     /******************************************/
