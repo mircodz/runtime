@@ -2180,13 +2180,14 @@ struct string_dedup_queue_stats
 // last at the join after the plan phase checks it for the strings that the GC demoted, which needs the regions of all the heaps to have their final
 // generations. Without regions a heap decides to demote its segments by itself, so the finder is for the server GC with regions only.
 //
-// The result is reported with the StringDedupFind GC event, once for every blocking or background GC. The payload of its version 1 is these
+// The result is reported with the StringDedupFind GC event, once for every blocking or background GC. The payload of its version 2 is these
 // uint64 values in order:
 //   GC index, status (0 active, 1 inactive because the table could not be allocated), condemned generation,
 //   candidates examined, candidates skipped because the object header holds a hash code, a lock or a sync block,
 //   duplicates found, bytes of the duplicates, canonical strings added, candidates not added because the table is full,
 //   entries removed because their string died, entries removed because the GC left their string in a younger generation,
-//   entries in the table after the GC, time the GC spent on the finder in microseconds, 1 for a background GC and 0 for a blocking GC.
+//   entries in the table after the GC, time the GC spent on the finder in microseconds, 1 for a background GC and 0 for a blocking GC,
+//   candidates that were not examined because the time that GCStringDedupBudgetUs gives the finder was spent.
 
 struct string_dedup_slot
 {
@@ -2223,6 +2224,7 @@ struct string_dedup_find_stats
     uint64_t demoted;
     uint64_t elapsed_us;
     uint64_t background;
+    uint64_t skipped_budget;
 };
 
 const size_t string_dedup_table_initial_capacity = (size_t)1 << 11;
@@ -2995,15 +2997,33 @@ static void string_dedup_pair_add (string_dedup_queue_state* owner, uint8_t* dup
 
 struct string_dedup_rooted_set;
 
+// The finder looks at the clock once for this many candidates, so it overruns the time that it has by at most as many.
+const size_t string_dedup_budget_check_interval = 256;
+
+// The time at which the finder stops examining the candidates of the GC that starts now, 0 when GCStringDedupBudgetUs sets no limit.
+static uint64_t string_dedup_find_deadline()
+{
+    int64_t budget = GCConfig::GetStringDedupBudgetUs();
+
+    return (budget > 0) ? (GetHighPrecisionTimeStamp() + (uint64_t)budget) : 0;
+}
+
 // Takes the candidates out of the queue 'source'. A string whose content is not in the table of the queue 'owner' becomes the canonical string for it,
 // any other string is a duplicate of the canonical one. The two are the same queue unless a server GC shares the table. 'roots' are the strings that
-// the roots lead to, nullptr when there are none.
-static void string_dedup_find_consume (string_dedup_queue_state* source, string_dedup_queue_state* owner, string_dedup_rooted_set* roots)
+// the roots lead to, nullptr when there are none. The candidates that are left when the clock reaches 'deadline' (0 for none) are not examined, and
+// are gone with the queue: a string leaves gen1 once.
+static void string_dedup_find_consume (string_dedup_queue_state* source, string_dedup_queue_state* owner, string_dedup_rooted_set* roots, uint64_t deadline)
 {
     string_dedup_table* table = owner->table;
     string_dedup_find_stats* stats = &owner->find;
     for (size_t i = 0; i < source->count; i++)
     {
+        if ((deadline != 0) && ((i % string_dedup_budget_check_interval) == 0) && (GetHighPrecisionTimeStamp() >= deadline))
+        {
+            stats->skipped_budget += source->count - i;
+            break;
+        }
+
         CObjectHeader* str = (CObjectHeader*)source->entries[i].obj;
         stats->candidates++;
 
@@ -3083,12 +3103,12 @@ static void string_dedup_find_consume (string_dedup_queue_state* source, string_
 
 static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t table_size)
 {
-    if (!GCEventEnabledStringDedupFind_V1())
+    if (!GCEventEnabledStringDedupFind_V2())
     {
         return;
     }
 
-    GCEventFireStringDedupFind_V1 (
+    GCEventFireStringDedupFind_V2 (
         stats->gc_index,
         stats->status,
         stats->condemned_generation,
@@ -3102,7 +3122,8 @@ static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t
         stats->demoted,
         (uint64_t)table_size,
         stats->elapsed_us,
-        stats->background
+        stats->background,
+        stats->skipped_budget
     );
 }
 
@@ -3250,8 +3271,8 @@ static void string_dedup_find_start (string_dedup_queue_state* owner, uint64_t g
 
 // Runs right after marking in a blocking GC that condemns gen1, when the queue has been filled and the plan phase has not changed anything. It
 // consumes the candidates of the queue 'source' into the table of the queue 'owner', which is the same queue unless a server GC shares the table.
-// 'roots' are the strings that the roots lead to, nullptr when there are none.
-static void string_dedup_find_after_mark (string_dedup_queue_state* owner, string_dedup_queue_state* source, string_dedup_rooted_set* roots)
+// 'roots' are the strings that the roots lead to, nullptr when there are none, 'deadline' is when the finder has to stop (see string_dedup_find_deadline).
+static void string_dedup_find_after_mark (string_dedup_queue_state* owner, string_dedup_queue_state* source, string_dedup_rooted_set* roots, uint64_t deadline)
 {
     string_dedup_find_stats* stats = &owner->find;
     uint64_t start_time = GetHighPrecisionTimeStamp();
@@ -3267,7 +3288,7 @@ static void string_dedup_find_after_mark (string_dedup_queue_state* owner, strin
     }
     else
     {
-        string_dedup_find_consume (source, owner, roots);
+        string_dedup_find_consume (source, owner, roots, deadline);
 
         // This also consumed the entries that an earlier GC could not, because the table could not be created then, so none is old anymore.
         source->first_new = 0;
@@ -3386,7 +3407,7 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
                 string_dedup_rooted_set* roots = nullptr;
 #endif //USE_REGIONS
 
-                string_dedup_find_after_mark (queue, queue, roots);
+                string_dedup_find_after_mark (queue, queue, roots, string_dedup_find_deadline());
             }
 #endif //!MULTIPLE_HEAPS
         }
@@ -3463,12 +3484,14 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
             string_dedup_rooted_set* roots = nullptr;
 #endif //USE_REGIONS
 
+            // The time of the finder is for all the heaps together, the ones that come after the time is spent have all their candidates skipped.
+            uint64_t deadline = string_dedup_find_deadline();
             for (int i = 0; i < n_heaps; i++)
             {
                 string_dedup_queue_state* source = g_heaps[i]->string_dedup_queue;
                 if (source != nullptr)
                 {
-                    string_dedup_find_after_mark (owner, source, roots);
+                    string_dedup_find_after_mark (owner, source, roots, deadline);
                 }
             }
         }
