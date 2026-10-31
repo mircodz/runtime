@@ -2339,6 +2339,10 @@ struct string_dedup_redirects
     size_t filter_capacity;
 };
 
+// The buffers of the pairs and of the redirections are kept for the next GC that merges, unless a GC with very many duplicates made them bigger than this.
+const size_t string_dedup_pairs_keep = (size_t)1 << 16;
+const size_t string_dedup_redirects_keep_slots = (size_t)1 << 18;
+
 #endif //USE_REGIONS
 
 // The queue of one heap with the statistics of the GC in progress. In a server GC the table of the finder and its statistics, and the state of the merge,
@@ -2347,6 +2351,8 @@ struct string_dedup_queue_state
 {
     string_dedup_candidate* entries;
     size_t count;
+    size_t capacity;     // the entries that are allocated, a full queue doubles them (string_dedup_queue_grow)
+    size_t max_capacity; // the most that it grows to, GCStringDedupQueueMax
     size_t first_new; // the entries from this index on were queued by the blocking GC in progress
     string_dedup_queue_stats gc;
     string_dedup_table* table;
@@ -2360,10 +2366,11 @@ struct string_dedup_queue_state
 #endif //USE_REGIONS
 };
 
+// The candidates that a queue has room for when it is created: it doubles when it is full, up to GCStringDedupQueueMax.
 #ifdef MULTIPLE_HEAPS
-const size_t string_dedup_queue_capacity = (size_t)1 << 14;
+const size_t string_dedup_queue_base_capacity = (size_t)1 << 14;
 #else //MULTIPLE_HEAPS
-const size_t string_dedup_queue_capacity = (size_t)1 << 16;
+const size_t string_dedup_queue_base_capacity = (size_t)1 << 16;
 #endif //MULTIPLE_HEAPS
 
 // The merge works on the pairs that the finder records, so it implies the finder, and it needs regions.
@@ -2482,21 +2489,60 @@ static bool string_dedup_pairs_reserve (string_dedup_queue_state* owner, size_t 
 }
 #endif //USE_REGIONS
 
+// The most that a queue grows to: GCStringDedupQueueMax, but not less than what it starts with and not more than 2^26 candidates (1 GB).
+static size_t string_dedup_queue_max_capacity()
+{
+    int64_t configured = GCConfig::GetStringDedupQueueMax();
+    size_t limit = (configured <= 0) ? 0 : ((configured > ((int64_t)1 << 26)) ? ((size_t)1 << 26) : (size_t)configured);
+
+    return (limit > string_dedup_queue_base_capacity) ? limit : string_dedup_queue_base_capacity;
+}
+
 static bool string_dedup_queue_reserve (string_dedup_queue_state* queue)
 {
+    queue->max_capacity = string_dedup_queue_max_capacity();
     if (queue->entries == nullptr)
     {
-        queue->entries = new (nothrow) string_dedup_candidate[string_dedup_queue_capacity];
+        queue->entries = new (nothrow) string_dedup_candidate[string_dedup_queue_base_capacity];
+        queue->capacity = (queue->entries != nullptr) ? string_dedup_queue_base_capacity : 0;
     }
-
-#if defined(USE_REGIONS) && !defined(MULTIPLE_HEAPS)
-    if (string_dedup_merge_enabled())
-    {
-        string_dedup_pairs_reserve (queue, string_dedup_queue_capacity);
-    }
-#endif //USE_REGIONS && !MULTIPLE_HEAPS
 
     return queue->entries != nullptr;
+}
+
+// Doubles the room of a full queue, up to its maximum. Returns false when it cannot grow, the candidate that does not fit is dropped then: a string
+// leaves gen1 once, so it is lost for good.
+static bool string_dedup_queue_grow (string_dedup_queue_state* queue)
+{
+    if (queue->capacity >= queue->max_capacity)
+    {
+        return false;
+    }
+
+    size_t capacity = (queue->capacity < (queue->max_capacity / 2)) ? (queue->capacity * 2) : queue->max_capacity;
+    string_dedup_candidate* entries = new (nothrow) string_dedup_candidate[capacity];
+    if (entries == nullptr)
+    {
+        return false;
+    }
+
+    memcpy (entries, queue->entries, queue->count * sizeof (string_dedup_candidate));
+    delete[] queue->entries;
+    queue->entries = entries;
+    queue->capacity = capacity;
+
+    return true;
+}
+
+// A queue that grew gives its memory back once it is empty, the next GC that needs the room grows it again.
+static void string_dedup_queue_shrink (string_dedup_queue_state* queue)
+{
+    if ((queue->count == 0) && (queue->capacity > string_dedup_queue_base_capacity))
+    {
+        delete[] queue->entries;
+        queue->entries = nullptr;
+        queue->capacity = 0;
+    }
 }
 
 static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_state* queue)
@@ -2512,7 +2558,7 @@ static void string_dedup_queue_add (CObjectHeader* str, string_dedup_queue_state
     {
         stats->skipped_header++;
     }
-    else if (queue->count == string_dedup_queue_capacity)
+    else if ((queue->count == queue->capacity) && !string_dedup_queue_grow (queue))
     {
         stats->dropped++;
     }
@@ -3032,6 +3078,7 @@ static void string_dedup_find_consume (string_dedup_queue_state* source, string_
     }
 
     source->count = 0;
+    string_dedup_queue_shrink (source);
 }
 
 static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t table_size)
@@ -3331,7 +3378,7 @@ void gc_heap::string_dedup_queue_after_mark (int condemned_gen_number)
             {
 #ifdef USE_REGIONS
                 string_dedup_rooted_set* roots = string_dedup_roots;
-                if (string_dedup_merge_enabled() && ((queue->pairs == nullptr) || string_dedup_roots_incomplete || ((roots != nullptr) && roots->incomplete)))
+                if (string_dedup_merge_enabled() && (!string_dedup_pairs_reserve (queue, queue->count + 1) || string_dedup_roots_incomplete || ((roots != nullptr) && roots->incomplete)))
                 {
                     queue->merge.status = 3;
                 }
@@ -3664,6 +3711,19 @@ void gc_heap::string_dedup_merge_end()
     }
 
     stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
+
+    // The buffers stay for the next GC that merges, unless this GC had so many duplicates that they are big.
+    if (map->slot_capacity > string_dedup_redirects_keep_slots)
+    {
+        delete[] map->slots;
+        map->slots = nullptr;
+        map->slot_capacity = 0;
+        map->slot_count = 0;
+        delete[] map->filter;
+        map->filter = nullptr;
+        map->filter_capacity = 0;
+        map->filter_bits = 0;
+    }
 }
 
 // Called by decide_on_compacting for a GC that is going to sweep, after every other reason to compact. A sweeping GC merges nothing, so a gen1 GC
@@ -3716,6 +3776,14 @@ void gc_heap::string_dedup_merge_report (string_dedup_queue_state* owner)
 #endif //BACKGROUND_GC && _DEBUG
 
     owner->pair_count = 0;
+
+    // The pairs are given back too when this GC had so many duplicates that they are big.
+    if (owner->pair_capacity > string_dedup_pairs_keep)
+    {
+        delete[] owner->pairs;
+        owner->pairs = nullptr;
+        owner->pair_capacity = 0;
+    }
 }
 
 #endif //USE_REGIONS
@@ -3882,13 +3950,18 @@ void gc_heap::string_dedup_queue_merge (gc_heap* from_hp)
     string_dedup_queue_state* to = string_dedup_queue;
     if ((to != nullptr) && string_dedup_queue_reserve (to))
     {
-        size_t room = string_dedup_queue_capacity - to->count;
+        while (((to->capacity - to->count) < from->count) && string_dedup_queue_grow (to))
+        {
+        }
+
+        size_t room = to->capacity - to->count;
         size_t moved = (from->count < room) ? from->count : room;
         memcpy (&to->entries[to->count], from->entries, moved * sizeof (string_dedup_candidate));
         to->count += moved;
     }
 
     from->count = 0;
+    string_dedup_queue_shrink (from);
 }
 #endif //DYNAMIC_HEAP_COUNT
 
