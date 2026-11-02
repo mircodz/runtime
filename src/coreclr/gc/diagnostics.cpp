@@ -3008,6 +3008,80 @@ static uint64_t string_dedup_find_deadline()
     return (budget > 0) ? (GetHighPrecisionTimeStamp() + (uint64_t)budget) : 0;
 }
 
+// The candidates of a queue do not depend on each other, but looking one up is a chain of cache misses: the slot of its hash, the pointer to the canonical
+// string in 'strings', and the canonical string itself. So the finder works ahead while it examines a candidate: it prefetches the string of the candidate that is
+// 'string_dedup_candidate_distance' ahead, hashes the one 'string_dedup_hash_distance' ahead and prefetches its slot, looks at the slot of the one
+// 'string_dedup_pointer_distance' ahead (it has arrived by now) and prefetches the pointer to its canonical string, and reads that pointer for the one
+// 'string_dedup_string_distance' ahead and prefetches the string. These are hints: the lookup of the candidate itself is the same as without them, so the
+// table may change in between, which it does with every canonical string that is added. The hashes wait in a ring until their candidate is examined.
+const size_t string_dedup_candidate_distance = 24;
+const size_t string_dedup_hash_distance = 12;
+const size_t string_dedup_pointer_distance = 8;
+const size_t string_dedup_string_distance = 4;
+const size_t string_dedup_ring_size = 16;
+static_assert (string_dedup_string_distance < string_dedup_pointer_distance, "The stages of the lookup are in the order of the chain of cache misses");
+static_assert (string_dedup_pointer_distance < string_dedup_hash_distance, "The stages of the lookup are in the order of the chain of cache misses");
+static_assert (string_dedup_hash_distance < string_dedup_ring_size, "The hashes of the candidates that are ahead have to fit in the ring");
+static_assert ((string_dedup_ring_size & (string_dedup_ring_size - 1)) == 0, "The ring is indexed with a mask");
+
+static inline string_dedup_slot* string_dedup_table_first_slot (string_dedup_table* table, uint32_t hash)
+{
+    return &table->slots[(size_t)hash & (table->slot_count - 1)];
+}
+
+// Hashes a candidate that is ahead and prefetches the slot that its hash leads to.
+static inline void string_dedup_hash_ahead (string_dedup_table* table, uint8_t* obj, uint32_t* ring, size_t position)
+{
+    uint32_t hash = string_dedup_table_hash (table, (CObjectHeader*)obj);
+    ring[position & (string_dedup_ring_size - 1)] = hash;
+    Prefetch ((void*)string_dedup_table_first_slot (table, hash));
+}
+
+// Prefetches what the first slot of 'hash' leads to when it is the slot of a canonical string with that hash: the pointer to the string, or the string.
+static inline void string_dedup_prefetch_canonical (string_dedup_table* table, uint32_t hash, bool pointer_ready)
+{
+    string_dedup_slot* slot = string_dedup_table_first_slot (table, hash);
+    if ((slot->entry != 0) && (slot->hash == hash))
+    {
+        if (pointer_ready)
+        {
+            uint8_t* canonical = table->strings[slot->entry - 1];
+            if (canonical != nullptr)
+            {
+                Prefetch ((void*)canonical);
+            }
+        }
+        else
+        {
+            Prefetch ((void*)&table->strings[slot->entry - 1]);
+        }
+    }
+}
+
+// The work that the finder does ahead while it examines the candidate at position 'i' of the 'count' that 'entries' has.
+static inline void string_dedup_work_ahead (string_dedup_table* table, const string_dedup_candidate* entries, size_t count, uint32_t* ring, size_t i)
+{
+    if ((i + string_dedup_candidate_distance) < count)
+    {
+        Prefetch ((void*)entries[i + string_dedup_candidate_distance].obj);
+    }
+
+    if ((i + string_dedup_hash_distance) < count)
+    {
+        string_dedup_hash_ahead (table, entries[i + string_dedup_hash_distance].obj, ring, i + string_dedup_hash_distance);
+    }
+
+    if ((i + string_dedup_pointer_distance) < count)
+    {
+        string_dedup_prefetch_canonical (table, ring[(i + string_dedup_pointer_distance) & (string_dedup_ring_size - 1)], false);
+    }
+
+    if ((i + string_dedup_string_distance) < count)
+    {
+        string_dedup_prefetch_canonical (table, ring[(i + string_dedup_string_distance) & (string_dedup_ring_size - 1)], true);
+    }
+}
+
 // Takes the candidates out of the queue 'source'. A string whose content is not in the table of the queue 'owner' becomes the canonical string for it,
 // any other string is a duplicate of the canonical one. The two are the same queue unless a server GC shares the table. 'roots' are the strings that
 // the roots lead to, nullptr when there are none. The candidates that are left when the clock reaches 'deadline' (0 for none) are not examined, and
@@ -3016,13 +3090,22 @@ static void string_dedup_find_consume (string_dedup_queue_state* source, string_
 {
     string_dedup_table* table = owner->table;
     string_dedup_find_stats* stats = &owner->find;
-    for (size_t i = 0; i < source->count; i++)
+    const size_t count = source->count;
+    uint32_t ring[string_dedup_ring_size];
+    for (size_t j = 0; (j < string_dedup_hash_distance) && (j < count); j++)
+    {
+        string_dedup_hash_ahead (table, source->entries[j].obj, ring, j);
+    }
+
+    for (size_t i = 0; i < count; i++)
     {
         if ((deadline != 0) && ((i % string_dedup_budget_check_interval) == 0) && (GetHighPrecisionTimeStamp() >= deadline))
         {
-            stats->skipped_budget += source->count - i;
+            stats->skipped_budget += count - i;
             break;
         }
+
+        string_dedup_work_ahead (table, source->entries, count, ring, i);
 
         CObjectHeader* str = (CObjectHeader*)source->entries[i].obj;
         stats->candidates++;
@@ -3044,7 +3127,7 @@ static void string_dedup_find_consume (string_dedup_queue_state* source, string_
         }
 
         uint32_t length = str->GetNumComponents();
-        uint32_t hash = string_dedup_table_hash (table, str);
+        uint32_t hash = ring[i & (string_dedup_ring_size - 1)];
         size_t free_slot = 0;
         string_dedup_slot* canonical = string_dedup_table_find (table, hash, str, length, &free_slot);
         if (canonical != nullptr)
@@ -3180,8 +3263,17 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
     memset (map->filter, 0, filter_bits / 8);
     map->slot_count = slot_count;
     map->filter_bits = filter_bits;
+    // The slot and the filter word of a duplicate are far from the ones of the one before, so the ones of a pair that is a few ahead are prefetched (see the finder).
+    const size_t ahead = 8;
     for (size_t i = 0; i < pair_count; i++)
     {
+        if ((i + ahead) < pair_count)
+        {
+            uint8_t* next = pairs[i + ahead].duplicate;
+            Prefetch ((void*)&map->slots[string_dedup_redirect_slot_of (next, slot_count)]);
+            Prefetch ((void*)&map->filter[string_dedup_redirect_filter_bit (next, filter_bits) / 64]);
+        }
+
         if (pairs[i].canonical == nullptr)
         {
             continue;
